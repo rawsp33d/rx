@@ -1,0 +1,192 @@
+use net
+use net.ws
+use sync
+use encoding.base64
+use json
+use json.{ Json, Obj }
+use math.{ max }
+
+pub shell :: fn(cwd := "", options: Obj = []) Obj {
+	opts := options
+	if cwd != "" do opts["cwd"] = cwd
+	["block" = ["flavor" = "com.superlogical.terminal.shell", "options" = opts]]
+}
+
+pub Session :: struct { pub session_id: string, pub label: string }
+pub Sessions :: struct { pub sessions: []Session }
+pub View :: struct { pub revision: int, pub label: ?string, pub active_window_id: ?string, pub windows: ?[]Window }
+pub Window :: struct { pub window_id: string, pub label: ?string, pub focused_block_id: ?string, pub zoomed_block_id: ?string, pub layers: []Layer }
+pub Layer :: struct { pub layer_id: ?string, pub kind: string, pub bounds: []float, pub state: ?string, pub layout: ?Json }
+pub Node :: struct { pub rect: []float, pub block_id: ?string, pub split: ?Split }
+pub Split :: struct { pub direction: string, pub ratio: float, pub before: Json, pub after: Json }
+pub Attached :: struct { pub client_id: string, pub view: View }
+pub Created :: struct { pub session_id: string, pub initial_windows: ?[]NewWindow }
+pub NewWindow :: struct { pub window_id: string, pub block_ids: []string }
+pub Ticket :: struct { pub ticket: string }
+pub Ok :: struct {}
+pub Process :: struct { pub child: ?Proc, pub foreground: ?Proc }
+pub Proc :: struct { pub cwd: ?string, pub name: string, pub argv0: ?string, pub script: ?string }
+pub Rex1 :: struct { pub type: string, pub cols: ?int, pub rows: ?int, pub owner: ?string, pub exit_code: ?int }
+pub Outer :: struct { pub type: string, pub payload: Body }
+pub Body :: struct { pub event: ?Event, pub call_id: ?string, pub action: ?string, pub args: ?Json, pub hash: ?string }
+pub Event :: struct { pub type: string, pub payload: Change }
+pub Change :: struct { pub revision: ?int, pub block_id: ?string, pub owner: ?string, pub name: ?string, pub payload: ?Json }
+
+pub cwd :: fn(proc: Process) string {
+	(proc.foreground or Proc.{}).cwd or (proc.child or Proc.{}).cwd or ""
+}
+
+pub Leaf :: struct { pub bid: string, pub rect: []float }
+
+pub leaves :: fn(tree: Json) []Leaf {
+	node :: json.from_json[Node](tree) or return []
+	if bid := node.block_id do return [Leaf.{ bid = bid, rect = node.rect }]
+	split :: node.split or return []
+	[..leaves(split.before), ..leaves(split.after)]
+}
+
+# a border takes the last column and row, unless at the edge
+pub grid :: fn(rect, bounds: []float, w, h: int) (x, y, cols, rows: int) {
+	x0, y0 :: cell((rect[0] - bounds[0]) / bounds[2], w), cell((rect[1] - bounds[1]) / bounds[3], h)
+	x1, y1 :: cell((rect[0] + rect[2] - bounds[0]) / bounds[2], w), cell((rect[1] + rect[3] - bounds[1]) / bounds[3], h)
+	(x0, y0, max(1, x1 - x0 - if x1 < w do 1 else do 0), max(1, y1 - y0 - if y1 < h do 1 else do 0))
+}
+
+pub cell :: fn(frac: float, cells: int) int {
+	int.(frac * float.(cells) + 0.5)
+}
+
+Msg :: struct { pub type: string, pub id: ?string, pub error: ?Fail, pub payload: ?Json }
+Fail :: struct { pub code: string, pub message: string }
+Welcome :: struct { pub type: string }
+
+# a reader thread forwards messages so writes stay on the owner thread
+pub Rex :: struct {
+	conn: ws.Ws
+	pub inbox: sync.Chan[ws.Message]
+	id: int
+	events: []Json
+	addr: string
+}
+
+# TODO: hostnames, ipv6 and tls. tailnet and https hosts need a forward
+dial :: fn(addr, path, proto: string) !ws.Ws {
+	host :: if addr.starts_with("unix://") do addr[7..] else do addr
+	parts :: host.split(":")
+	sock :: if host.starts_with("/") || parts.len() != 2 {
+		net.connect_unix(host)?
+	} else {
+		net.connect(parts[0], int.try_from(parts[1])?)?
+	}
+	ws.connect(sock, "rex", path, [proto])
+}
+
+pub connect :: fn(addr: string) !Rex {
+	sock := dial(addr, "/api/control", "rex.control.v1")?
+	hello: Obj = ["type" = "hello", "api_revision" = 11.0, "client" = ["kind" = "app", "name" = "rx", "version" = "0"]]
+	sock.send(Json.(hello).str(), false)?
+	welcome :: json.decode[Welcome](sock.recv()?.data)?
+	if welcome.type != "welcome" do return error("rex: expected a welcome, got {welcome.type}")
+
+	inbox := sync.Chan[ws.Message].{}
+	sync.spawn! {
+		reader := sock
+		loop {
+			msg :: reader.recv() or break
+			inbox <- msg or break
+		}
+		inbox.close()
+	}
+	.{ conn = sock, inbox = inbox, addr = addr }
+}
+
+Rex :< {
+	pub close :: fn(self) {
+		self.conn.close()
+	}
+
+	pub call[T] :: fn(mut self; method: string, payload: Obj = []) !T {
+		self.id += 1
+		id :: self.id.str()
+		req: Obj = ["type" = "request", "id" = id, "method" = method, "payload" = payload]
+		self.conn.send(Json.(req).str(), false)?
+		loop {
+			msg :: self.next()?
+			if msg.type == "event" do self.events << (msg.payload or :null)
+			if msg.type != "response" || (msg.id or "") != id do continue
+			if fail := msg.error do return error("{method}: {fail.message}")
+			return json.from_json[T](msg.payload or :null)
+		}
+	}
+
+	pub data :: fn(mut self; sid, bid: string, id: int, sink: sync.Chan[Chunk]) !Stream {
+		ticket :: self.call[Ticket]("data.connect", [
+			"session_id" = sid, "block_id" = bid,
+			"data_ref_id" = "terminal", "subprotocol" = "rex.data.terminal.v1",
+		])?
+		stream(self.addr, string.([u8.(1)]) + base64.decode(ticket.ticket, url = true)?, id, sink)
+	}
+
+	pub queued :: fn(mut self) ?Json {
+		if self.events.len() == 0 do return none
+		event :: self.events[0]
+		self.events = self.events[1..]
+		event
+	}
+
+	pub take :: fn(mut self; got: ?ws.Message) ! {
+		msg :: got or return error("rex: connection closed")
+		if msg.ping do return self.conn.pong(msg.data)
+		parsed :: json.decode[Msg](msg.data)?
+		if parsed.type == "event" do self.events << (parsed.payload or :null)
+	}
+
+	next :: fn(mut self) !Msg {
+		loop {
+			msg :: self.inbox.recv() or return error("rex: connection closed")
+			if !msg.ping do return json.decode[Msg](msg.data)
+			self.conn.pong(msg.data)?
+		}
+	}
+}
+
+# a GHOSTSNP snapshot, then VT with rex1 messages mixed in
+pub Stream :: struct {
+	conn: ws.Ws
+	pub nonce: u64
+}
+
+pub Chunk :: struct { pub id: int, pub data: ?string }
+
+stream :: fn(addr, hello: string, id: int, sink: sync.Chan[Chunk]) !Stream {
+	sock := dial(addr, "/api/data", "rex.data.terminal.v1")?
+	sock.send(hello, true)?
+	welcome :: sock.recv()?.data
+	if welcome.len() != 32 || welcome[0] != 0x81 {
+		sock.close()
+		return error("rex: data handshake rejected, reason {int.(welcome[welcome.len() - 1])}")
+	}
+	nonce := u64.(0)
+	loop i in 0..8 do nonce |= u64.(welcome[24 + i]) << (8 * i)
+
+	out := sink
+	sync.spawn! {
+		reader := sock
+		loop {
+			msg :: reader.recv() or break
+			if msg.ping {
+				reader.pong(msg.data) or break
+				continue
+			}
+			out <- Chunk.{ id = id, data = msg.data } or break
+		}
+		out <- Chunk.{ id = id } or {}
+	}
+	.{ conn = sock, nonce = nonce }
+}
+
+Stream :< {
+	pub close :: fn(self) {
+		self.conn.close()
+	}
+}

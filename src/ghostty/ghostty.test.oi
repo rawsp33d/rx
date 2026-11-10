@@ -1,0 +1,42 @@
+use libc
+
+test! "draw" {
+	null :: ptr.(0)
+	out :: unsafe libc.malloc(16)
+	defer unsafe libc.free(out)
+	check(unsafe ghostty_terminal_new(null, out, 20, 4), "terminal") or panic!($.message())
+	term :: unsafe out.read[ptr]()
+	defer unsafe ghostty_terminal_free(term)
+	vt :: "hi \e[1;31mred\e[0m \e[48;5;200m界\e[0m\e[?2004h\e[2;5H\e[44m\e[K\e[0m\e[H"
+	unsafe ghostty_terminal_vt_write(term, vt.ptr, usize.(vt.len()))
+	check(unsafe ghostty_snapshot_encode_alloc(term, null, out, out.offset(8)), "encode") or panic!($.message())
+	bytes :: unsafe out.read[ptr]()
+	len :: unsafe out.offset(8).read[usize]()
+	defer unsafe ghostty_free(null, bytes, len)
+
+	snap :: unsafe bytes.string(int.(len))
+	screen, rest := decode(snap + "tail") or panic!($.message())
+	defer screen.free()
+	assert! rest == snap.len()
+	drawn :: screen.draw(2, 1, 20, 4, true)
+	assert! drawn.starts_with("\e[2;3H\e[0mhi \e[0;1;31mred\e[0m \e[0;48;5;200m界\e[0m ") && drawn.contains("\e[5;3H") && drawn.contains("\e[3;3H\e[0m    \e[0;44m ")
+	assert! screen.draw(2, 1, 20, 4, false) == ""
+	screen.write("!")
+	again :: screen.draw(0, 0, 20, 4, false)
+	cursor, cx, cy := screen.cursor(0, 0, 20, 4)
+	hidden, _, _ := screen.cursor(0, 0, 1, 4)
+	assert! again.starts_with("\e[1;1H") && cursor.ends_with("\e[1;2H\e[?25h") && cx == 1 && cy == 0 && hidden == "\e[?25l"
+	assert! screen.modes().contains("\e[?2004h") && screen.modes().contains("\e[?1000l") && !screen.held()
+	screen.write("\e[?2026h\e[?1049h")
+	assert! screen.held() && screen.mode(1049) && screen.mode(1007) # alternate scroll is on by default
+	screen.write("\e[?1049l\e[?2026l\r\n\r\n\r\n\r\n")
+	assert! !screen.scrolled() && screen.scroll(-2) && screen.scrolled() && screen.scroll(0) && !screen.scrolled() && !screen.scroll(5)
+	# the first row, "!i red 界", scrolled into history
+	top, rows, total := screen.viewport()
+	assert! top == 1 && rows == 4 && total == 5 && screen.cols() == 20
+	# rows past 256 cols used to get cut short
+	wide :: blank(300, 1) or panic!($.message())
+	defer wide.free()
+	loop 0..300 do wide.write("x")
+	assert! wide.draw(0, 0, 300, 1, true).len() == 314
+}

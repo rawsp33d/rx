@@ -1,0 +1,83 @@
+use json
+use json.{ Json, Obj }
+
+# rx's own actions. binds no keys, init.lua does
+pub REQUEST :: r"""{
+	"actions": [
+		{"name": "detach", "kind": "client", "title": "Detach"},
+		{"name": "pane.split", "kind": "client", "title": "Split Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
+		{"name": "pane.close", "kind": "client", "title": "Close Pane"},
+		{"name": "pane.zoom", "kind": "client", "title": "Zoom Pane"},
+		{"name": "pane.focus", "kind": "client", "title": "Focus Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
+		{"name": "tab.new", "kind": "client", "title": "New Tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
+		{"name": "tab.next", "kind": "client", "title": "Next Tab"},
+		{"name": "tab.previous", "kind": "client", "title": "Previous Tab"},
+		{"name": "tab.close", "kind": "client", "title": "Close Tab"},
+		{"name": "client.mode.enter", "kind": "client", "title": "Enter Mode", "args": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+		{"name": "client.mode.exit", "kind": "client", "title": "Exit Mode"},
+		{"name": "client.mode.exit_all", "kind": "client", "title": "Exit All Modes"}
+	]
+}"""
+
+pub Binding :: struct { pub keys: []string, pub action: string, pub args: ?Json, pub mode: ?string }
+pub Action :: struct { pub name: string, pub title: ?string }
+pub Config :: struct { pub hash: string }
+pub Mode :: struct { pub name: string, pub exclusive: bool, pub blocked: ?[][]string }
+
+pub Args :: struct { pub direction: ?string, pub name: ?string, pub side: ?string, pub command: ?string }
+
+pub Keymap :: struct { pub bindings: []Binding, pub actions: ?[]Action, pub modes: ?[]Mode, pub config: Config }
+
+Request :: struct { pub actions: []Action }
+
+pub request :: fn() !Obj {
+	j :: json.parse(REQUEST)?
+	match j {
+		is Obj => j,
+		_ => error("keymap: REQUEST isn't an object"),
+	}
+}
+
+pub declared :: fn() ![]Action {
+	json.decode[Request](REQUEST)?.actions
+}
+
+pub ours :: fn() ![string]() {
+	out: [string]() = .[]
+	loop action in declared()? do out[action.name] = ()
+	out
+}
+
+pub can :: fn(km: Keymap) ![string]() {
+	out := ours()?
+	out["client.key.forward"] = ()
+	loop action in km.actions or [] do out[action.name] = ()
+	out
+}
+
+# the mode's bindings win, then the root's. drop means the mode ate the key
+pub resolve :: fn(km: Keymap, typed: [][]string, can: [string](), mode: string) (binding: ?Binding, drop: bool) {
+	if hit := find(km.bindings, typed, can, mode) do return (hit, false)
+	if mode == "" do return
+	loop entry in km.modes or [] {
+		if entry.name != mode do continue
+		if entry.exclusive do return (none, true)
+		loop keys in entry.blocked or [] {
+			if keys.len() == typed.len() && matches(keys, typed) do return
+		}
+	}
+	binding = find(km.bindings, typed, can, "")
+	return
+}
+
+find :: fn(bindings: []Binding, typed: [][]string, can: [string](), mode: string) ?Binding {
+	bindings.find({ ($.mode or "") == mode && $.action in can && matches($.keys, typed) })
+}
+
+matches :: fn(keys: []string, typed: [][]string) bool {
+	if keys.len() < typed.len() do return false
+	loop i in 0..typed.len() {
+		if keys[i] !in typed[i] do return false
+	}
+	true
+}

@@ -1,0 +1,275 @@
+use libc
+
+@link.{"../.deps/ghostty-vt/lib/libghostty-vt.so"}
+ghostty_snapshot_decoder_new_buf : fn(alloc: ptr, out: ptr, p: ptr, n: usize) i32 : foreign
+ghostty_snapshot_decoder_decode : fn(dec: ptr, out: ptr) i32 : foreign
+ghostty_snapshot_decoder_get : fn(dec: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_snapshot_decoder_free : fn(dec: ptr) : foreign
+ghostty_snapshot_encode_alloc : fn(term: ptr, alloc: ptr, out: ptr, n: ptr) i32 : foreign
+ghostty_terminal_new : fn(alloc: ptr, out: ptr, cols: u16, rows: u16) i32 : foreign
+ghostty_terminal_vt_write : fn(term: ptr, p: ptr, n: usize) : foreign
+ghostty_terminal_resize : fn(term: ptr, cols: u16, rows: u16, cell_w: u32, cell_h: u32) i32 : foreign
+ghostty_terminal_get : fn(term: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_terminal_free : fn(term: ptr) : foreign
+ghostty_terminal_scroll_viewport : fn(term: ptr, to: Viewport) : foreign
+ghostty_render_state_new : fn(alloc: ptr, out: ptr) i32 : foreign
+ghostty_render_state_update : fn(state: ptr, term: ptr) i32 : foreign
+ghostty_render_state_get : fn(state: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_render_state_set : fn(state: ptr, opt: i32, value: ptr) i32 : foreign
+ghostty_render_state_clean : fn(state: ptr) i32 : foreign
+ghostty_render_state_free : fn(state: ptr) : foreign
+ghostty_render_state_row_iterator_new : fn(alloc: ptr, out: ptr) i32 : foreign
+ghostty_render_state_row_iterator_next_dirty : fn(rows: ptr, y: ptr) bool : foreign
+ghostty_render_state_row_iterator_free : fn(rows: ptr) : foreign
+ghostty_render_state_row_get : fn(rows: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_render_state_row_cells_new : fn(alloc: ptr, out: ptr) i32 : foreign
+ghostty_render_state_row_cells_next : fn(cells: ptr) bool : foreign
+ghostty_render_state_row_cells_get : fn(cells: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_render_state_row_cells_free : fn(cells: ptr) : foreign
+ghostty_cell_get : fn(cell: u64, data: i32, out: ptr) i32 : foreign
+ghostty_free : fn(alloc: ptr, p: ptr, n: usize) : foreign
+
+@c Viewport :: struct { tag: i32, delta: int, pad: u64 }
+
+modes :: [1 66 1000 1002 1003 1004 1006 2004]
+
+pub decode :: fn(snap: string) !(Term, int) {
+	null :: ptr.(0)
+	out :: unsafe libc.malloc(8)
+	defer unsafe libc.free(out)
+
+	check(unsafe ghostty_snapshot_decoder_new_buf(null, out, snap.ptr, usize.(snap.len())), "decoder")?
+	dec :: unsafe out.read[ptr]()
+	defer unsafe ghostty_snapshot_decoder_free(dec)
+
+	check(unsafe ghostty_snapshot_decoder_decode(dec, out), "decode")?
+	term :: unsafe out.read[ptr]()
+	check(unsafe ghostty_snapshot_decoder_get(dec, 2, out), "source offset")? # SOURCE_OFFSET
+
+	(Term.new(term), int.(unsafe out.read[usize]()))
+}
+
+check :: fn(code: i32, what: string) ! {
+	if code != 0 do return error("ghostty: {what} failed ({code})")
+}
+
+pub blank :: fn(cols, rows: int) !Term {
+	out :: unsafe libc.malloc(8)
+	defer unsafe libc.free(out)
+	check(unsafe ghostty_terminal_new(ptr.(0), out, u16.(cols), u16.(rows)), "terminal")?
+	Term.new(unsafe out.read[ptr]())
+}
+
+pub Term :: struct {
+	term, state, rows, cells: ptr
+	buf: ptr
+}
+
+Term :< {
+	new :: fn(term: ptr) Self {
+		null :: ptr.(0)
+		buf :: unsafe libc.malloc(256)
+		discard unsafe ghostty_render_state_new(null, buf)
+		state :: unsafe buf.read[ptr]()
+		discard unsafe ghostty_render_state_row_iterator_new(null, buf)
+		rows :: unsafe buf.read[ptr]()
+		discard unsafe ghostty_render_state_row_cells_new(null, buf)
+		Self.{
+			term = term,
+			state = state,
+			rows = rows,
+			cells = unsafe buf.read[ptr](),
+			buf = buf,
+		}
+	}
+
+	pub free :: fn(self) {
+		unsafe ghostty_render_state_row_cells_free(self.cells)
+		unsafe ghostty_render_state_row_iterator_free(self.rows)
+		unsafe ghostty_render_state_free(self.state)
+		unsafe ghostty_terminal_free(self.term)
+		unsafe libc.free(self.buf)
+	}
+
+	pub write :: fn(self; vt: string) {
+		if vt != "" do unsafe ghostty_terminal_vt_write(self.term, vt.ptr, usize.(vt.len()))
+	}
+
+	pub resize :: fn(self; cols, rows: int) {
+		discard unsafe ghostty_terminal_resize(self.term, u16.(cols), u16.(rows), 1, 1)
+	}
+
+	pub scroll :: fn(self; delta: int) bool {
+		was :: self.scrolled()
+		unsafe ghostty_terminal_scroll_viewport(self.term, Viewport.{ tag = if delta == 0 do 1 else do 2, delta = delta })
+		was || self.scrolled()
+	}
+
+	pub scrolled :: fn(self) bool {
+		discard unsafe ghostty_terminal_get(self.term, 32, self.buf) # VIEWPORT_ACTIVE
+		unsafe self.buf.read[u8]() == 0
+	}
+
+	pub draw :: fn(self; x, y, w, h: int, all: bool) string {
+		buf :: self.buf
+		discard unsafe ghostty_render_state_update(self.state, self.term)
+		if all {
+			unsafe buf.write(i32.(2)) # DIRTY_FULL
+			discard unsafe ghostty_render_state_set(self.state, 0, buf) # OPTION_DIRTY
+		}
+		unsafe buf.write(self.rows)
+		discard unsafe ghostty_render_state_get(self.state, 4, buf) # ROW_ITERATOR
+		out := Buffer.{}
+		drawn := false
+
+		loop {
+			more :: unsafe ghostty_render_state_row_iterator_next_dirty(self.rows, buf)
+			if !more do break
+			row :: int.(unsafe buf.read[u16]())
+			if row >= h do continue
+			drawn = true
+			out.write("\e[{y + row + 1};{x + 1}H")
+			unsafe buf.write(self.cells)
+			discard unsafe ghostty_render_state_row_get(self.rows, 3, buf) # CELLS
+			sgr, col := "", 0
+			loop col < w {
+				more :: unsafe ghostty_render_state_row_cells_next(self.cells)
+				if !more do break
+				discard unsafe ghostty_render_state_row_cells_get(self.cells, 1, buf) # RAW
+				raw :: unsafe buf.read[u64]()
+				discard unsafe ghostty_cell_get(raw, 3, buf) # WIDE
+				wide :: unsafe buf.read[i32]()
+				if wide == 2 do continue # spacer tail
+				if wide == 1 && col + 1 >= w do break
+				style :: self.sgr(raw)
+				if style != sgr {
+					out.write(style)
+					sgr = style
+				}
+				glyph :: self.text()
+				out.write(if glyph == "" do " " else do glyph)
+				col += if wide == 1 do 2 else do 1
+			}
+		}
+
+		discard unsafe ghostty_render_state_clean(self.state)
+		if drawn do out.write("\e[0m")
+		out.str()
+	}
+
+	# palette colors stay indices so the outer theme applies
+	sgr :: fn(self; raw: u64) string {
+		buf :: self.buf
+		discard unsafe ghostty_render_state_row_cells_get(self.cells, 8, buf) # HAS_STYLING
+		styled :: unsafe buf.read[u8]() != 0
+		if !styled {
+			# an erase leaves its background in the cell, not the style
+			discard unsafe ghostty_cell_get(raw, 2, buf) # CONTENT_TAG
+			tag :: unsafe buf.read[i32]()
+			if tag == 2 { # BG_COLOR_PALETTE
+				discard unsafe ghostty_cell_get(raw, 10, buf) # COLOR_PALETTE
+				return "\e[0" + palette(int.(unsafe buf.read[u8]()), 40) + "m"
+			}
+			if tag != 3 do return "\e[0m" # BG_COLOR_RGB
+			discard unsafe ghostty_cell_get(raw, 11, buf) # COLOR_RGB
+			return "\e[0;48;2;{rgb(buf)}m"
+		}
+		style :: buf.offset(32)
+		unsafe style.write(usize.(72))
+		discard unsafe ghostty_render_state_row_cells_get(self.cells, 2, style) # STYLE
+		seq := "\e[0"
+		loop (at, code) in [(56, "1"), (57, "3"), (58, "2"), (59, "5"), (60, "7"), (61, "8"), (62, "9"), (63, "53")] {
+			on :: unsafe style.offset(at).read[u8]() != 0
+			if on do seq += ";" + code
+		}
+		underline :: unsafe style.offset(64).read[i32]()
+		if underline > 0 do seq += ";4:{underline}"
+		seq + color(style.offset(8), 30) + color(style.offset(24), 40) + color(style.offset(40), 50) + "m"
+	}
+
+	text :: fn(self) string {
+		graphemes :: self.buf.offset(8)
+		unsafe graphemes.write(self.buf.offset(128))
+		unsafe graphemes.offset(8).write(usize.(128))
+		if unsafe ghostty_render_state_row_cells_get(self.cells, 9, graphemes) != 0 {
+			return "?" # GRAPHEMES_UTF8
+		}
+		unsafe self.buf.offset(128).string(int.(unsafe graphemes.offset(16).read[usize]()))
+	}
+
+	pub cursor :: fn(self; x, y, w, h: int) (seq: string, cx, cy: int) {
+		hide :: ("\e[?25l", -1, -1)
+		buf :: self.buf
+		discard unsafe ghostty_render_state_get(self.state, 14, buf) # CURSOR_VIEWPORT_HAS_VALUE
+		discard unsafe ghostty_render_state_get(self.state, 11, buf.offset(1)) # CURSOR_VISIBLE
+		shown, visible :: unsafe buf.read[u8]() != 0, unsafe buf.offset(1).read[u8]() != 0
+		if !shown || !visible do return hide
+		discard unsafe ghostty_render_state_get(self.state, 15, buf.offset(2)) # CURSOR_VIEWPORT_X
+		discard unsafe ghostty_render_state_get(self.state, 16, buf.offset(4)) # CURSOR_VIEWPORT_Y
+		discard unsafe ghostty_render_state_get(self.state, 10, buf.offset(8)) # CURSOR_VISUAL_STYLE
+		discard unsafe ghostty_render_state_get(self.state, 12, buf.offset(12)) # CURSOR_BLINKING
+		cx, cy :: int.(unsafe buf.offset(2).read[u16]()), int.(unsafe buf.offset(4).read[u16]())
+		if cx >= w || cy >= h do return hide # another client sized the block bigger
+		style, blink :: int.(unsafe buf.offset(8).read[i32]()), unsafe buf.offset(12).read[u8]() != 0
+		# DECSCUSR steady shapes for bar, block, underline, hollow block, one less to blink
+		shape :: [6, 2, 4, 2][style % 4] - if blink do 1 else do 0
+		("\e[{shape} q\e[{y + cy + 1};{x + cx + 1}H\e[?25h", x + cx, y + cy)
+	}
+
+	pub title :: fn(self) string {
+		buf :: self.buf
+		if unsafe ghostty_terminal_get(self.term, 12, buf) != 0 do return "" # TITLE
+		start :: unsafe buf.read[ptr]()
+		unsafe start.string(int.(unsafe buf.offset(8).read[usize]()))
+	}
+
+	pub viewport :: fn(self) (top: int, rows: int, total: int) {
+		buf :: self.buf
+		discard unsafe ghostty_terminal_get(self.term, 9, buf) # SCROLLBAR
+		total = int.(unsafe buf.read[u64]())
+		top = int.(unsafe buf.offset(8).read[u64]())
+		rows = int.(unsafe buf.offset(16).read[u64]())
+		return
+	}
+
+	pub cols :: fn(self) int {
+		discard unsafe ghostty_terminal_get(self.term, 1, self.buf) # COLS
+		int.(unsafe self.buf.read[u16]())
+	}
+
+	pub held :: fn(self) bool { self.mode(2026) }
+
+	pub mode :: fn(self; num: int) bool {
+		unsafe self.buf.write(u16.(num))
+		discard unsafe ghostty_terminal_get(self.term, 37, self.buf) # MODE
+		unsafe self.buf.offset(2).read[u8]() != 0
+	}
+
+	pub modes :: fn(self) string {
+		buf :: self.buf
+		seq := ""
+		loop mode in modes do seq += "\e[?{mode}" + if self.mode(mode) do "h" else do "l"
+		discard unsafe ghostty_terminal_get(self.term, 8, buf) # KITTY_KEYBOARD_FLAGS
+		flags :: unsafe buf.read[u8]()
+		seq + "\e[={flags};1u"
+	}
+}
+
+color :: fn(style: ptr, base: int) string {
+	tag :: unsafe style.read[i32]()
+	value :: style.offset(8)
+	if tag == 1 do return palette(int.(unsafe value.read[u8]()), base) # PALETTE
+	if tag == 2 do return ";{base + 8};2;{rgb(value)}" # RGB
+	""
+}
+
+palette :: fn(i, base: int) string {
+	if base < 50 && i < 8 do return ";{base + i}"
+	if base < 50 && i < 16 do return ";{base + 52 + i}"
+	";{base + 8};5;{i}"
+}
+
+rgb :: fn(color: ptr) string {
+	r, g, b :: unsafe color.read[u8](), unsafe color.offset(1).read[u8](), unsafe color.offset(2).read[u8]()
+	"{r};{g};{b}"
+}

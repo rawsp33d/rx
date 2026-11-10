@@ -1,4 +1,725 @@
+use os
+use net
+use fs
+use libc
+use tty
+use sync
+use time
+use json
+use math.{ min, max }
+use json.{ Json, Obj }
+use rex
+use rex.{ Sessions, View, Window, Attached, Created, NewWindow, Ok, Process, Rex1, Outer, Body, Leaf, leaves, cell }
+use strip
+use keys
+use keymap
+use ghostty
+use layout.{ Area }
+
+Done :: struct { client_actions: ?[]keymap.Binding }
+Clients :: struct { clients: ?[]Peer }
+Peer :: struct { client_id: ?string }
+
+
+reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
+
+# secs a program may hold a frame (2026)
+hold :: 1
+
 main :: fn() {
-	who :: "Mom"
-	print("Hi {who}!")
+	discard unsafe setlocale(0, "C.UTF-8".cstr()) # LC_CTYPE, for wcwidth
+	cli(os.args()[1..]) or {
+		eprint("rx: {$.message()}")
+		os.exit(1)
+	}
+}
+
+cli :: fn(args: []string) ! {
+	args := args
+	sock := os.env("REX_SERVER") or { "unix://" + (os.env("XDG_RUNTIME_DIR") or "") + "/rex/server.sock" }
+	if args.len() > 1 && args[0] == "-S" {
+		sock = args[1]
+		args = args[2..]
+	}
+	autostart(sock)
+	if args.len() > 0 && args[0] in ["help", "-h", "--help"] {
+		print(usage)
+		return ()
+	}
+	label :: named(args)
+	if args.len() > 1 || label.starts_with("-") {
+		eprint(usage)
+		os.exit(2)
+	}
+	run(sock, label)
+}
+
+named :: fn(args: []string) string {
+	if args.len() > 0 && args[0] != "." do return args[0]
+	fs.Path.(os.cwd()).name()
+}
+
+usage :: "rx, a Rex TUI client
+
+usage: rx [-S server] [name]
+
+create/join session name in current dir. name is a session label or id,
+or . for the cwd's name, the default.
+
+flags:
+  -S server   unix socket or host:port, default $REX_SERVER"
+
+autostart :: fn(sock: string) {
+	path :: if sock.starts_with("unix://") do sock[7..] else do sock
+	if !path.starts_with("/") && path.split(":").len() == 2 do return
+	conn :: net.connect_unix(path) or {
+		discard os.sh("rex -S {quote(sock)} server start >/dev/null")
+		return
+	}
+	conn.close()
+}
+
+quote :: fn(text: string) string { "'" + text.replace("'", "'\\''") + "'" }
+
+out :: fn(text: string) {
+	at := 0
+	loop at < text.len() {
+		wrote :: unsafe libc.write(1, text.ptr.offset(at), usize.(text.len() - at))
+		if wrote <= 0 do return
+		at += int.(wrote)
+	}
+}
+
+run :: fn(sock, label: string) ! {
+	conn := rex.connect(sock)?
+	defer conn.close()
+	term :: tty.raw(0)?
+	out("\e[?1049h")
+	defer out(reset_modes + "\e[?1049l")
+	input :: tty.input(0)
+	resizes :: tty.resizes(1)
+
+	label := label
+	sid := ""
+	loop session in conn.call[Sessions]("session.list")?.sessions {
+		if session.label == label || session.session_id == label do sid, label = session.session_id, session.label
+	}
+	# it would draw itself inside itself forever
+	if sid != "" && sid == (os.env("REX_SESSION") or "") do return error("already in {label}")
+	if sid == "" {
+		sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = [["layout" = rex.shell(os.cwd())]]])?.session_id
+	}
+	att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
+	view := att.view
+	if (view.windows or []).len() == 0 {
+		discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
+		view = conn.call[View]("session.view", ["session_id" = sid])?
+	}
+	client := Client.{ conn = conn, sid = sid, cid = att.client_id, owned = true, chunks = sync.Chan[rex.Chunk].{}, keys = input }
+	client.load_keymap()?
+	client.apply(view)?
+	client.serve(resizes) or {
+		client.close()
+		return $
+	}
+	client.close()
+}
+
+minimized :: fn(win: Window) bool {
+	win.layers.any({ ($.state or "") == "minimized" })
+}
+
+runs :: fn(cmd: string) Obj {
+	opts: Obj = []
+	if cmd != "" do opts["command"] = ["sh", "-c", cmd]
+	opts
+}
+axis :: fn(dir: string) string { if dir == "left" || dir == "right" do "horizontal" else do "vertical" }
+side :: fn(dir: string) string { if dir == "left" || dir == "up" do "before" else do "after" }
+Pane :: struct {
+	bid: string
+	id: int
+	stream: rex.Stream
+	strip: strip.Strip
+	got: string
+	term: ghostty.Term
+	painted, full: bool
+	sized: bool
+	layer: int
+	holding: bool
+	since: time.Instant
+	x, y, w, h: int
+}
+
+Pane :< {
+	feed :: fn(mut self; data, cid: string) bool {
+		buf := data
+		if !self.painted {
+			self.got += data
+			term, rest := ghostty.decode(self.got) or return true
+			self.term = term
+			self.painted = true
+			self.full = true
+			buf = self.got[rest..]
+			self.got = ""
+		}
+		vt :: self.strip.feed(buf)
+		ours := true
+		at := 0
+		loop (i, msg) in self.strip.msgs {
+			self.term.write(vt[at..i])
+			at = i
+			event :: json.decode[Rex1](msg) or continue
+			if event.type == "child_exited" do self.term.write("\r\n[exited {event.exit_code or 0}]")
+			if event.type != "resize" do continue
+			self.term.resize(event.cols or 1, event.rows or 1)
+			self.full = true
+			# the first resize is the snapshot's size, from before the claim
+			if (event.owner or "") != cid && self.sized do ours = false
+			self.sized = true
+		}
+		self.strip.msgs = []
+		self.term.write(vt[at..])
+		ours
+	}
+
+	draw :: fn(mut self; all: bool) string {
+		if !self.painted do return ""
+		held :: !all && self.term.held()
+		if held && !self.holding do self.since = time.Instant.now()
+		self.holding = held
+		if held && self.since.elapsed() < hold.sec() do return ""
+		self.full = false
+		self.term.draw(self.x, self.y, self.w, self.h, all)
+	}
+
+	close :: fn(self) {
+		self.stream.close()
+		if self.painted do self.term.free()
+	}
+}
+
+Client :: struct {
+	conn: rex.Rex
+	sid, cid: string
+	bid, wid: string
+	view: View
+	panes: []Pane
+	chunks: sync.Chan[rex.Chunk]
+	keys: sync.Chan[string]
+	unread: string
+	streams, cols, rows, revision, peers: int
+	modes: string
+	owned: bool
+	full: bool
+	km: keymap.Keymap
+	can, ours: [string]()
+	hash: string
+	modes_on: []string # innermost last
+	typed: [][]string
+	eaten: []string # keys a binding took, their release and repeats drop too
+	areas: []Area
+	msg, shown: string
+	msg_at: time.Instant
+	bad: bool
+}
+
+Client :< {
+	serve :: fn(mut self; resizes: sync.Chan[tty.Size]) ! {
+		loop :run {
+			loop {
+				event :: self.conn.queued() or break
+				if self.event(event)? do break :run
+			}
+			if self.panes.len() == 0 do break
+			sync.select! {
+				got := <-self.keys => {
+					buf :: got or break :run
+					if self.input(buf)? do break :run
+				},
+				_ := <-resizes => {
+					self.owned = true
+					self.relayout()?
+				},
+				msg := <-self.conn.inbox => self.conn.take(msg)?,
+				chunk := <-self.chunks => {
+					self.data(chunk or break :run)
+					loop 0..64 do self.data(self.chunks.try_recv() or break)
+					self.draw()
+				},
+				sync.after(self.wake()) => self.tick(),
+			}
+		}
+	}
+
+	apply :: fn(mut self; view: View) ! {
+		self.view = view
+		self.relayout()?
+	}
+
+	relayout :: fn(mut self) ! {
+		view :: self.view
+		self.revision = view.revision
+		size :: tty.size(1)?
+		self.cols = int.(size.cols)
+		self.rows = int.(size.rows)
+		h :: self.rows - 1
+		win :: self.win()
+		bid :: win.focused_block_id or ""
+		self.wid = win.window_id
+		self.bid = bid
+		tiled := ""
+		loop layer in win.layers {
+			if layer.kind == "tiled" do tiled = layer.layer_id or ""
+		}
+		self.areas = [Area.{ w = self.cols, h = h, id = tiled }]
+		whole :: [0.0, 0.0, 1.0, 1.0]
+		kept := []Pane.{}
+		loop layer in win.layers {
+			tiled :: layer.kind == "tiled"
+			if win.zoomed_block_id != none || (layer.state or "") == "minimized" do continue
+			bounds :: layer.bounds
+			if !tiled {
+				x0, y0 :: cell(bounds[0], self.cols), cell(bounds[1], h)
+				x1, y1 :: cell(bounds[0] + bounds[2], self.cols), cell(bounds[1] + bounds[3], h)
+				self.areas << Area.{ x = x0 + 1, y = y0 + 1, w = max(1, x1 - x0 - 2), h = max(1, y1 - y0 - 2), id = layer.layer_id or "" }
+			}
+			area :: if tiled do 0 else do self.areas.len() - 1
+			kept << self.place(leaves(layer.layout or :null), bounds, area)
+		}
+		if zoomed := win.zoomed_block_id {
+			kept = self.place([Leaf.{ bid = zoomed, rect = whole }], whole, 0)
+		}
+		loop pane in self.panes do pane.close()
+		self.panes = kept
+		# only the active client claims, or two would trade blocks forever
+		if self.owned do self.own()
+		self.redraw()
+	}
+
+	win :: fn(self) Window {
+		active :: self.view.active_window_id or ""
+		(self.view.windows or []).find({ $.window_id == active }) or Window.{}
+	}
+
+	place :: fn(mut self; leafs: []Leaf, bounds: []float, layer: int) []Pane {
+		area :: self.areas[layer]
+		loop leaf in leafs {
+			pane := self.take(leaf.bid) or self.open(leaf.bid) or continue
+			x, y, w, h :: rex.grid(leaf.rect, bounds, area.w, area.h)
+			pane.x = area.x + x
+			pane.y = area.y + y
+			pane.w = w
+			pane.h = h
+			pane.layer = layer
+			pane
+		}
+	}
+
+	take :: fn(mut self; bid: string) ?Pane {
+		loop i in 0..self.panes.len() {
+			if self.panes[i].bid != bid do continue
+			pane :: self.panes[i]
+			rest := self.panes[..i]
+			rest << self.panes[(i + 1)..]
+			self.panes = rest
+			return pane
+		}
+		none
+	}
+
+	open :: fn(mut self; bid: string) !Pane {
+		self.streams += 1
+		stream :: self.conn.data(self.sid, bid, self.streams, self.chunks)?
+		Pane.{ bid = bid, id = self.streams, stream = stream, strip = strip.Strip.new(stream.nonce) }
+	}
+
+	close :: fn(mut self) {
+		loop pane in self.panes do pane.close()
+		self.panes = []
+		self.chunks.close()
+	}
+
+	data :: fn(mut self; chunk: rex.Chunk) {
+		loop i in 0..self.panes.len() {
+			if self.panes[i].id != chunk.id do continue
+			data :: chunk.data or return
+			if !self.panes[i].feed(data, self.cid) do self.owned = false
+			return
+		}
+	}
+
+	draw :: fn(mut self) {
+		all := self.full
+		loop pane in self.panes {
+			if pane.full do all = true
+		}
+		frame := "\e[?2026h"
+		if all do frame += "\e[0m\e[H\e[2J"
+		bar :: self.bar()
+		if all || bar != self.shown {
+			frame += bar
+			self.shown = bar
+		}
+		cursor := "\e[?25l"
+		over, redraw := all, all
+		layer := -1
+		loop i in 0..self.panes.len() {
+			if self.panes[i].layer != layer {
+				layer = self.panes[i].layer
+				redraw = all || over && layer > 0
+				if redraw do frame += self.borders(layer)
+			}
+			drawn :: self.panes[i].draw(redraw)
+			if drawn != "" do over = true
+			frame += drawn
+			pane :: self.panes[i]
+			if pane.bid != self.bid || !pane.painted do continue
+			# always bracket pastes so input can tell them from typing
+			modes :: pane.term.modes() + "\e[?2004h"
+			if modes != self.modes {
+				frame += modes
+				self.modes = modes
+			}
+			seq, cx, cy := pane.term.cursor(pane.x, pane.y, pane.w, pane.h)
+			cursor = seq
+			if self.areas[(pane.layer + 1)..].any({ $.covers(cx, cy) }) do cursor = "\e[?25l"
+		}
+		self.full = false
+		out(frame + cursor + "\e[?2026l")
+	}
+
+	redraw :: fn(mut self) {
+		self.full = true
+		self.draw()
+	}
+
+	wake :: fn(self) time.Duration {
+		if self.msg != "" do return 250.ms()
+		loop pane in self.panes {
+			if pane.holding do return 250.ms()
+		}
+		2.sec()
+	}
+
+	tick :: fn(mut self) {
+		if self.msg != "" && self.msg_at.elapsed() > 3.sec() do self.msg = ""
+		self.draw()
+	}
+
+	say :: fn(mut self; msg: string, bad := false) {
+		self.msg = msg
+		self.bad = bad
+		self.msg_at = time.Instant.now()
+		self.draw()
+	}
+
+	borders :: fn(self; layer: int) string {
+		area :: self.areas[layer]
+		cols :: self.cols
+		bottom :: area.y + area.h
+		focus := Pane.{ x = -2, y = -2 }
+		edge: [int]() = .[]
+		buf := Buffer.{}
+		loop pane in self.panes {
+			if pane.layer != layer do continue
+			if pane.bid == self.bid do focus = pane
+			right, below :: pane.x + pane.w, pane.y + pane.h
+			if right < area.x + area.w {
+				loop y in pane.y..min(below + 1, bottom) do edge[y * cols + right] = ()
+			}
+			if below < bottom {
+				loop x in pane.x..min(right + 1, area.x + area.w) do edge[below * cols + x] = ()
+			}
+		}
+		if layer > 0 {
+			loop y in area.y..(area.y + area.h) {
+				buf.write("\e[{y + 1};{area.x + 1}H\e[0m\e[{area.w}X")
+				edge[y * cols + area.x - 1] = ()
+				edge[y * cols + area.x + area.w] = ()
+			}
+			loop x in (area.x - 1)..(area.x + area.w + 1) {
+				edge[(area.y - 1) * cols + x] = ()
+				edge[(area.y + area.h) * cols + x] = ()
+			}
+		}
+		lines :: " │││─┘┐┤─└┌├─┴┬┼".runes() # 1 up, 2 down, 4 left, 8 right
+		loop at in edge.keys {
+			x, y :: at % cols, at / cols
+			joins := 0
+			if (at - cols) in edge do joins |= 1
+			if (at + cols) in edge do joins |= 2
+			if x > 0 && (at - 1) in edge do joins |= 4
+			if x + 1 < cols && (at + 1) in edge do joins |= 8
+			near :: x >= focus.x - 1 && x <= focus.x + focus.w && y >= focus.y - 1 && y <= focus.y + focus.h
+			buf.write("\e[{y + 1};{x + 1}H" + (if near do "\e[32m" else do "\e[39m") + lines[joins].str())
+		}
+		buf.str()
+	}
+
+	bar :: fn(mut self) string {
+		label :: " " + (self.view.label or "") + " "
+		pill :: if self.typed.len() > 0 do "\e[30;43m" else do "\e[30;44m"
+		line := "\e[{self.rows};1H\e[?7l\e[0m\e[2K" + pill + label
+		plain := label
+		modes: []string = loop mode in self.modes_on do mode
+		if self.peers > 0 do modes << "+{self.peers} attached"
+		loop mode in modes {
+			line += "\e[0;1;35m {mode}"
+			plain += " {mode}"
+		}
+		line += "\e[0m "
+		plain += " "
+		active :: self.view.active_window_id or ""
+		wins :: self.view.windows or []
+		loop i in 0..wins.len() {
+			win :: wins[i]
+			name :: win.label or ""
+			flags :: (if win.zoomed_block_id != none do " Z" else do "") + if minimized(win) do " M" else do ""
+			current :: win.window_id == active
+			line += (if current do "\e[0;30;42m " else do "\e[0m ") + "{i + 1}" + (if name != "" do " " + name else do "") + (if current do "" else do "\e[33m") + flags + " "
+			plain += " {i + 1}" + (if name != "" do " " + name else do "") + flags + " "
+		}
+		clock :: " " + time.Time.now().format("%H:%M") + " "
+		left :: cells(plain) + 1
+		end := self.cols
+		if left + clock.len() <= self.cols do end -= clock.len() + 1
+		right := "\e[0m"
+		text := ""
+		if pane := self.focused(), pane.painted do text = pane.term.title()
+		if self.msg != "" {
+			right = if self.bad do "\e[0;1;31m" else do "\e[0;1m"
+			text = self.msg
+		}
+		width :: cells(text)
+		col :: max(left + 1, end - width + 1)
+		if text != "" do line += "\e[{self.rows};{col}H" + right + text
+		if col + width - 1 > end do line += "\e[{self.rows};{end}H…"
+		if end < self.cols do line += "\e[{self.rows};{end + 1}H\e[0m \e[30;44m" + clock
+		line + "\e[0m\e[?7h"
+	}
+
+	event :: fn(mut self; raw: Json) !bool {
+		outer :: json.from_json[Outer](raw) or return false
+		if outer.type == "session_destroyed" do return true
+		if outer.type == "keymap_changed" && (outer.payload.hash or "") != self.hash {
+			self.load_keymap()?
+		}
+		if outer.type == "client_perform_requested" do return self.requested(outer.payload)
+		ev :: outer.payload.event or return false
+		change :: ev.payload
+		if ev.type in ["client_connected", "client_disconnected"] {
+			self.peers = (self.others() or []).len()
+			self.draw()
+		}
+		if ev.type == "block_owner_changed" && (change.owner or "") != self.cid {
+			if self.panes.any({ $.bid == (change.block_id or "") }) do self.owned = false
+		}
+		if ev.type != "session_view_changed" || (change.revision or 0) <= self.revision do return false
+		view :: self.call[View]("session.view") or return false # killed, session_destroyed follows
+		self.apply(view)?
+		# Rex keeps an empty session, tmux doesn't
+		if (view.windows or []).len() == 0 do discard self.call[Ok]("session.destroy") or Ok.{}
+		self.panes.len() == 0
+	}
+
+	input :: fn(mut self; data: string) !bool {
+		if !self.owned do self.own()
+		pass := ""
+		self.unread += data
+		loop self.unread != "" {
+			buf :: self.unread
+			if buf.starts_with("\e[200~") {
+				# a paste skips the keymap, or its newlines would be ctrl+j
+				body :: buf[6..].split("\e[201~")
+				if body.len() < 2 do break
+				used :: body[0].len() + 12
+				self.unread = buf[used..]
+				pane :: self.focused() or Pane.{}
+				pass += if pane.painted && pane.term.mode(2004) do buf[..used] else do body[0]
+				continue
+			}
+			parsed, used := keys.key_of(buf)
+			self.unread = buf[used..]
+			key :: parsed or {
+				pass += buf[..used]
+				continue
+			}
+			if key.action != "press" {
+				if key.code in self.eaten {
+					if key.action == "release" do self.eaten = self.eaten.filter({ $ != key.code })
+				} else do pass += buf[..used]
+				continue
+			}
+			typed := self.typed
+			typed << key.names
+			hit, drop := keymap.resolve(self.km, typed, self.can, self.modes_on.last() or "")
+			hit :: hit or {
+				if self.typed.len() == 0 && !drop do pass += buf[..used] else do self.eat(key)
+				self.typed = []
+				continue
+			}
+			self.eat(key)
+			if hit.keys.len() > typed.len() {
+				self.typed = typed
+				continue
+			}
+			self.typed = []
+			self.write(pass)?
+			pass = ""
+			if self.perform(hit, key) or { self.say($.message(), true); false } do return true
+		}
+		self.write(pass)?
+		if self.bar() != self.shown do self.draw()
+		false
+	}
+
+	focused :: fn(self) ?Pane {
+		self.panes.find({ $.bid == self.bid })
+	}
+
+	painted :: fn(self) !Pane {
+		pane :: self.focused() or return error("no pane")
+		if !pane.painted do return error("no pane")
+		pane
+	}
+
+	eat :: fn(mut self; key: keys.Key) {
+		if key.code !in self.eaten do self.eaten << key.code
+	}
+
+	perform :: fn(mut self; binding: keymap.Binding, key: keys.Key) !bool {
+		if binding.action == "client.key.forward" && binding.keys.len() > 0 {
+			prefix: []Json = loop name in binding.keys[..(binding.keys.len() - 1)] do Json.(name)
+			self.ok("client.key", ["block_id" = self.bid, "key" = key.ev, "prefix" = prefix])?
+			return false
+		}
+		if binding.action in self.ours do return self.act(binding.action, binding.args)
+		done :: self.call[Done]("client.action", [
+			"action" = binding.action, "args" = binding.args or :null, "origin" = "key", "block_id" = self.bid,
+		])?
+		loop action in done.client_actions or [] {
+			if action.action in self.ours && self.act(action.action, action.args)? do return true
+		}
+		false
+	}
+
+	others :: fn(mut self) ![]Peer {
+		loop peer in self.call[Clients]("session.list_clients")?.clients or [] { if (peer.client_id or "") == self.cid do continue; peer }
+	}
+
+	act :: fn(mut self; name: string, args: ?Json) !bool {
+		empty: Obj = []
+		opts :: json.from_json[keymap.Args](args or { empty }) or keymap.Args.{}
+		dir :: opts.direction or "right"
+		match name {
+			"detach" => return true,
+			"pane.split" => {
+				pane :: self.focused() or Pane.{}
+				# the longer side, a cell is about twice as tall as wide
+				towards :: opts.direction or if pane.w >= 2 * pane.h do "right" else do "down"
+				shell :: rex.shell(self.here(), runs(opts.command or ""))
+				self.ok("session.new_split", ["direction" = axis(towards), "side" = side(towards), "layout" = shell, "focus" = true])?
+			},
+			"pane.close" => self.ok("block.close", ["block_id" = self.bid])?,
+			"pane.zoom" => self.ok("session.zoom_block")?,
+			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
+			"tab.new" => self.new_tab(opts.side or "", opts.command or "")?,
+			"tab.next" => self.ok("session.focus_next_window", ["wrap" = true])?,
+			"tab.previous" => self.ok("session.focus_previous_window", ["wrap" = true])?,
+			"tab.close" => self.ok("session.close_window")?,
+			"client.mode.enter", "client.mode.exit", "client.mode.exit_all" => {
+				if name == "client.mode.enter" {
+					self.modes_on << (opts.name or return error("client.mode.enter needs a name"))
+				}
+				if name == "client.mode.exit" && self.modes_on.len() > 0 {
+					self.modes_on = self.modes_on[..(self.modes_on.len() - 1)]
+				}
+				if name == "client.mode.exit_all" do self.modes_on = []
+				self.redraw()
+			},
+			else => return error("not_supported: rx has no action {name}"),
+		}
+		false
+	}
+
+	new_tab :: fn(mut self; side, cmd: string) ! {
+		tab :: self.call[NewWindow]("session.new_window", ["layout" = rex.shell(self.here(), runs(cmd))])?
+		wins :: self.view.windows or []
+		at := wins.len()
+		active :: self.view.active_window_id or ""
+		loop win, i in wins {
+			if win.window_id == active do at = i + if side == "after" do 1 else do 0
+		}
+		if side != "" && at < wins.len() {
+			self.ok("session.move_window", ["window_id" = tab.window_id, "before_window_id" = wins[at].window_id])?
+		}
+	}
+
+	here :: fn(mut self) string {
+		rex.cwd(self.tcall[Process](self.bid, "process") or Process.{})
+	}
+
+	requested :: fn(mut self; body: Body) !bool {
+		reply: Obj = ["call_id" = body.call_id or ""]
+		name :: body.action or ""
+		detach :: self.act(name, body.args) or {
+			reply["error"] = ["code" = if name in self.ours do "internal" else do "not_supported", "message" = $.message()]
+			false
+		}
+		if "error" !in reply do reply["result"] = :null
+		discard self.conn.call[Ok]("client.reply", reply)?
+		detach
+	}
+
+	load_keymap :: fn(mut self) ! {
+		km :: self.conn.call[keymap.Keymap]("client.keymap", keymap.request()?)?
+		self.km = km
+		self.can = keymap.can(km)?
+		self.ours = keymap.ours()?
+		self.hash = km.config.hash
+		self.typed = []
+		self.peers = (self.others() or []).len()
+	}
+
+	own :: fn(mut self) {
+		ids: []Json = loop pane in self.panes do Json.(pane.bid)
+		self.ok("session.own_block", ["block_ids" = ids]) or return
+		loop pane in self.panes {
+			self.term(pane.bid, "resize", ["columns" = float.(pane.w), "rows" = float.(pane.h)]) or return
+		}
+		self.owned = true
+	}
+
+	write :: fn(mut self; data: string) ! {
+		if data == "" do return ()
+		self.term(self.bid, "write", ["data" = data])?
+	}
+
+	term :: fn(mut self; bid, method: string, args: Obj) ! {
+		discard self.tcall[Ok](bid, method, args)?
+	}
+
+	tcall[T] :: fn(mut self; bid, method: string, args: Obj = []) !T {
+		self.call[T]("com.superlogical.terminal." + method, ["block_id" = bid, "args" = args])
+	}
+
+	ok :: fn(mut self; method: string, payload: Obj = []) ! {
+		discard self.call[Ok](method, payload)?
+	}
+
+	call[T] :: fn(mut self; method: string, payload: Obj = []) !T {
+		body := payload
+		body["session_id"] = self.sid
+		self.conn.call[T](method, body)
+	}
+}
+
+setlocale : fn(category: i32, name: cstr) ptr : foreign
+wcwidth : fn(c: i32) i32 : foreign
+
+# TODO: libc's widths, emoji can differ from the outer terminal's
+cells :: fn(text: string) width: int {
+	loop char in text.runes() do width += max(unsafe wcwidth(i32.(char)), 0)
+	return
 }

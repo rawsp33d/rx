@@ -1,0 +1,44 @@
+# takes our rex1 messages out of a stream, even one split across chunks
+pub Strip :: struct {
+	marker: string
+	carry: string
+	pub msgs: [](int, string) # offset into the VT and its JSON
+}
+
+Strip :< {
+	pub new :: fn(nonce: u64) Self {
+		Self.{ marker = "\e_rex1;{nonce};" }
+	}
+
+	pub feed :: fn(mut self; data: string) (vt: string) {
+		parts :: (self.carry + data).split(self.marker)
+		vt = parts[0]
+		self.carry = ""
+		loop part in parts[1..] {
+			end :: part.split("\e\\")
+			if end.len() == 1 {
+				self.carry = self.marker + part
+				continue
+			}
+			self.msgs << (vt.len(), end[0])
+			vt += end[1..].join("\e\\")
+		}
+		loop len in 1..self.marker.len() {
+			if self.carry == "" && vt.ends_with(self.marker[..len]) {
+				self.carry = self.marker[..len]
+				vt = vt[..(vt.len() - len)]
+			}
+		}
+		vt
+	}
+}
+
+test! "strip" {
+	input :: "a\e_rex1;7;{{}}\e\\b\e_rex1;8;{{}}\e\\"
+	strip := Strip.new(7)
+	out := ""
+	loop i in 0..input.len() do out += strip.feed(input[i..(i + 1)])
+	assert! out == "ab\e_rex1;8;{{}}\e\\" && strip.msgs == [(0, "{{}}")]
+	whole := Strip.new(7)
+	assert! whole.feed(input) == "ab\e_rex1;8;{{}}\e\\" && whole.msgs == [(1, "{{}}")]
+}

@@ -1,0 +1,27 @@
+use json.{ Json }
+
+test! "key of" {
+	show :: fn(seq: string) string {
+		parsed, used := key_of(seq)
+		key :: parsed or return "none {used}"
+		names := [key.names[0]]
+		loop name in key.names[2..] do names << name
+		spelled :: names.join(" ")
+		"{Json.(key.ev).str()} {spelled} {used}"
+	}
+	assert! show("!x") == r"""{"key":"digit_1","unshifted_codepoint":49,"text":"!","consumed_mods":"shift","composing":false,"action":"press","mods":"shift"} shift+1 ! 1"""
+	assert! show("\e[104;7u") == r"""{"key":"key_h","unshifted_codepoint":104,"text":"","consumed_mods":"","composing":false,"action":"press","mods":"ctrl+alt"} ctrl+alt+h 8"""
+	assert! show("\0").ends_with(" ctrl+space 1") && show("\e[32;5u").ends_with(" ctrl+space 7")
+	assert! show("D").ends_with(" shift+d 1") && show("\e[100u").ends_with(" d 6")
+	assert! show("\e[1;5A").contains(r""""key":"arrow_up"""") && show("\e[1;5A").ends_with(" ctrl+up 6")
+	assert! show("\eOB").ends_with(" down 3") && show("\e[6~").ends_with(" pagedown 4") && show("\e[Z").ends_with(" shift+tab 3")
+	assert! show("\ex").ends_with(" alt+x 2") && show("\e").ends_with(" esc 1") && show("\e[29~") == "none 5"
+	assert! show("\eOP").ends_with(" f1 3") && show("\e[1;5R").ends_with(" ctrl+f3 6") && show("\e[15~").ends_with(" f5 5")
+	assert! show("\e[57376u").ends_with(" f13 8") && show("\e[57400u").contains(r""""key":"numpad_1","unshifted_codepoint":49,"text":"1"""") && show("\e[57441u") == "none 8"
+	kp, _ := key_of("\e[57414;5u")
+	assert! (kp or panic!("no key")).names.join(" ") == "ctrl+enter ctrl+[NumpadEnter]"
+	# ghostty only sends these with keybind = ctrl+tab=csi:9;5u
+	assert! show("\e[9;5u").ends_with(" ctrl+tab 6") && show("\e[9;6u").ends_with(" ctrl+shift+tab 6")
+	rel, _ := key_of("\e[100;1:3u")
+	assert! (rel or panic!("no key")).action == "release" && show("\e[100;1:3u").contains(r"""action":"release""")
+}

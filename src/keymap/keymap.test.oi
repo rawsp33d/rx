@@ -1,0 +1,27 @@
+use json
+
+test! "find" {
+	km :: json.decode[Keymap](r"""{"config": {"hash": ""}, "bindings": [
+		{"keys": ["ctrl+space", "d"], "action": "detach"},
+		{"keys": ["ctrl+space", "x"], "action": "nope"},
+		{"keys": ["ctrl+space", "x"], "action": "pane.close"},
+		{"keys": ["ctrl+g"], "action": "client.key.forward"},
+		{"keys": ["z"], "action": "pane.zoom", "mode": "resize"},
+		{"keys": ["z"], "action": "pane.zoom", "mode": "only"}
+	], "modes": [
+		{"name": "resize", "exclusive": false, "blocked": [["ctrl+g"]]},
+		{"name": "only", "exclusive": true}
+	]}""") or panic!($.message())
+	can :: can(km) or panic!($.message())
+	action :: fn(typed: [][]string, mode: string) string {
+		binding, drop := resolve(km, typed, can, mode)
+		if drop do return "drop"
+		(binding or return "").action
+	}
+	assert! action([["ctrl+space"]], "") == "detach"
+	assert! action([["ctrl+space"], ["x"]], "") == "pane.close"
+	assert! action([["ctrl+space"], ["shift+5", "%"]], "") == ""
+	assert! action([["ctrl+g"]], "") == "client.key.forward" && action([["z"]], "") == ""
+	assert! action([["z"]], "resize") == "pane.zoom" && action([["ctrl+space"]], "resize") == "detach" && action([["ctrl+g"]], "resize") == ""
+	assert! action([["z"]], "only") == "pane.zoom" && action([["ctrl+space"]], "only") == "drop"
+}
