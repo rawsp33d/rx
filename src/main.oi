@@ -191,11 +191,13 @@ run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 		loop peer in client.others()? do client.kick(peer) or {} # like tmux attach -d
 	}
 	client.apply(view)?
-	client.serve(resizes) or {
+	client.pump(resizes) or {
 		client.close()
+		conn = client.conn
 		return $
 	}
 	client.close()
+	conn = client.conn
 }
 
 ask :: fn(prompt: string, input: sync.Chan[string], at: string, pending := "") (line, rest: string) {
@@ -258,6 +260,8 @@ Pane :: struct {
 	stream: rex.Stream
 	strip: strip.Strip
 	got: string
+	read: int
+	ended: bool
 	term: ghostty.Term
 	painted, full: bool
 	sized: bool
@@ -345,6 +349,50 @@ Client :: struct {
 }
 
 Client :< {
+	pump :: fn(mut self; resizes: sync.Chan[tty.Size]) ! {
+		loop {
+			self.serve(resizes) or {
+				if !self.conn.lost do return $
+				self.reconnect()?
+				continue
+			}
+			return ()
+		}
+	}
+
+	reconnect :: fn(mut self) ! {
+		typed := ""
+		at :: time.Instant.now()
+		loop {
+			self.say("reconnecting, C-c quits", true)
+			self.conn = self.conn.reconnect() or {
+				if at.elapsed() > 2.min() do return error("lost the server")
+				sync.select! {
+					got := <-self.keys => {
+						buf :: got or return error("input closed")
+						parsed, _ := keys.key_of(buf)
+						if "ctrl+c" in (parsed or keys.Key.{}).names do return error("lost the server")
+						typed += buf
+						()
+					},
+					sync.after(1.sec()) => {},
+				}
+				continue
+			}
+			break
+		}
+		if !self.conn.resumed {
+			self.cid = self.call[Attached]("session.attach")?.client_id
+			self.load_keymap()?
+		}
+		self.say("reconnected")
+		self.apply(self.call[View]("session.view")?)?
+		loop i in 0..self.panes.len() {
+			if self.panes[i].ended do self.revive(i)
+		}
+		discard self.input(typed)?
+	}
+
 	serve :: fn(mut self; resizes: sync.Chan[tty.Size]) ! {
 		loop :run {
 			loop {
@@ -519,6 +567,31 @@ Client :< {
 		Pane.{ bid = bid, id = self.streams, stream = stream, strip = strip.Strip.new(stream.nonce) }
 	}
 
+	# the server ends a stream when output piles up
+	revive :: fn(mut self; i: int) {
+		pane :: self.panes[i]
+		stream :: pane.stream.resume(pane.read) or {
+			self.panes[i].ended = true
+			if !pane.painted do return
+			self.reopen(i)
+			return
+		}
+		self.panes[i].stream = stream
+		self.panes[i].ended = false
+	}
+
+	reopen :: fn(mut self; i: int) {
+		old :: self.panes[i]
+		pane := self.open(old.bid) or return
+		old.close()
+		pane.x = old.x
+		pane.y = old.y
+		pane.w = old.w
+		pane.h = old.h
+		pane.layer = old.layer
+		self.panes[i] = pane
+	}
+
 	close :: fn(mut self) {
 		loop pane in self.panes do pane.close()
 		self.panes = []
@@ -528,7 +601,11 @@ Client :< {
 	data :: fn(mut self; chunk: rex.Chunk) {
 		loop i in 0..self.panes.len() {
 			if self.panes[i].id != chunk.id do continue
-			data :: chunk.data or return
+			data :: chunk.data or {
+				self.revive(i)
+				return
+			}
+			self.panes[i].read += data.len()
 			if !self.panes[i].feed(data, self.cid) do self.owned = false
 			return
 		}

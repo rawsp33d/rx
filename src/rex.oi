@@ -58,7 +58,8 @@ pub cell :: fn(frac: float, cells: int) int {
 
 Msg :: struct { pub type: string, pub id: ?string, pub error: ?Fail, pub payload: ?Json }
 Fail :: struct { pub code: string, pub message: string }
-Welcome :: struct { pub type: string }
+Welcome :: struct { pub type: string, pub client: ?Client }
+Client :: struct { pub reconnect_token: string, pub resumed: ?bool }
 
 # a reader thread forwards messages so writes stay on the owner thread
 pub Rex :: struct {
@@ -66,7 +67,9 @@ pub Rex :: struct {
 	pub inbox: sync.Chan[ws.Message]
 	id: int
 	events: []Json
-	addr: string
+	addr, token: string
+	pub resumed: bool
+	pub lost: bool
 }
 
 # TODO: hostnames, ipv6 and tls. tailnet and https hosts need a forward
@@ -81,12 +84,14 @@ dial :: fn(addr, path, proto: string) !ws.Ws {
 	ws.connect(sock, "rex", path, [proto])
 }
 
-pub connect :: fn(addr: string) !Rex {
+pub connect :: fn(addr: string, token := "") !Rex {
 	sock := dial(addr, "/api/control", "rex.control.v1")?
 	hello: Obj = ["type" = "hello", "api_revision" = 11.0, "client" = ["kind" = "app", "name" = "rx", "version" = "0"]]
+	if token != "" do hello["reconnect_token"] = token
 	sock.send(Json.(hello).str(), false)?
 	welcome :: json.decode[Welcome](sock.recv()?.data)?
 	if welcome.type != "welcome" do return error("rex: expected a welcome, got {welcome.type}")
+	who :: welcome.client or Client.{}
 
 	inbox := sync.Chan[ws.Message].{}
 	sync.spawn! {
@@ -97,7 +102,7 @@ pub connect :: fn(addr: string) !Rex {
 		}
 		inbox.close()
 	}
-	.{ conn = sock, inbox = inbox, addr = addr }
+	.{ conn = sock, inbox = inbox, addr = addr, token = who.reconnect_token, resumed = who.resumed or false }
 }
 
 Rex :< {
@@ -105,11 +110,19 @@ Rex :< {
 		self.conn.close()
 	}
 
+	# TODO: leaks the dead socket, closing it sends a close frame that ends the client
+	pub reconnect :: fn(self) !Rex {
+		connect(self.addr, self.token)
+	}
+
 	pub call[T] :: fn(mut self; method: string, payload: Obj = []) !T {
 		self.id += 1
 		id :: self.id.str()
 		req: Obj = ["type" = "request", "id" = id, "method" = method, "payload" = payload]
-		self.conn.send(Json.(req).str(), false)?
+		self.conn.send(Json.(req).str(), false) or {
+			self.lost = true
+			return $
+		}
 		loop {
 			msg :: self.next()?
 			if msg.type == "event" do self.events << (msg.payload or :null)
@@ -135,7 +148,10 @@ Rex :< {
 	}
 
 	pub take :: fn(mut self; got: ?ws.Message) ! {
-		msg :: got or return error("rex: connection closed")
+		msg :: got or {
+			self.lost = true
+			return error("rex: connection closed")
+		}
 		if msg.ping do return self.conn.pong(msg.data)
 		parsed :: json.decode[Msg](msg.data)?
 		if parsed.type == "event" do self.events << (parsed.payload or :null)
@@ -143,7 +159,10 @@ Rex :< {
 
 	next :: fn(mut self) !Msg {
 		loop {
-			msg :: self.inbox.recv() or return error("rex: connection closed")
+			msg :: self.inbox.recv() or {
+				self.lost = true
+				return error("rex: connection closed")
+			}
 			if !msg.ping do return json.decode[Msg](msg.data)
 			self.conn.pong(msg.data)?
 		}
@@ -154,6 +173,10 @@ Rex :< {
 pub Stream :: struct {
 	conn: ws.Ws
 	pub nonce: u64
+	token: string # from the latest WELCOME, to resume
+	addr: string
+	id: int
+	sink: sync.Chan[Chunk]
 }
 
 pub Chunk :: struct { pub id: int, pub data: ?string }
@@ -182,11 +205,18 @@ stream :: fn(addr, hello: string, id: int, sink: sync.Chan[Chunk]) !Stream {
 		}
 		out <- Chunk.{ id = id } or {}
 	}
-	.{ conn = sock, nonce = nonce }
+	.{ conn = sock, nonce = nonce, token = welcome[1..17], addr = addr, id = id, sink = sink }
 }
 
 Stream :< {
+	# close with 1000, or the server holds the stream for a resume
 	pub close :: fn(self) {
 		self.conn.close()
+	}
+
+	# TODO: leaks the old socket too
+	pub resume :: fn(self; read: int) !Stream {
+		bytes: []u8 = loop i in 0..8 do u8.((read >> (8 * i)) & 255)
+		stream(self.addr, string.([u8.(2)]) + self.token + string.(bytes), self.id, self.sink)
 	}
 }
