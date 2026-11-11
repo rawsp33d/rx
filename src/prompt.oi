@@ -1,0 +1,10 @@
+pub chop :: fn(line: string) string {
+	if line == "" do return line
+	end := line.len() - 1
+	loop end > 0 && line[end] & 0xc0 == 0x80 do end -= 1
+	line[..end]
+}
+
+test! "chop" {
+	assert! chop("ab") == "a" && chop("aé") == "a" && chop("") == ""
+}

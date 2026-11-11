@@ -6,14 +6,15 @@ use tty
 use sync
 use time
 use json
-use math.{ min, max }
+use math.{ min, max, clamp }
 use json.{ Json, Obj }
 use rex
-use rex.{ Sessions, View, Window, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
+use rex.{ Sessions, View, Window, Layer, Node, Split, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
 use strip
 use keys
 use keymap
 use ghostty
+use prompt.{ chop }
 use layout.{ Area }
 use encoding.base64
 
@@ -197,6 +198,28 @@ run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 	client.close()
 }
 
+ask :: fn(prompt: string, input: sync.Chan[string], at: string, pending := "") (line, rest: string) {
+	rest = pending
+	loop {
+		out(at + "{prompt}{line}\e[?25h")
+		if rest == "" do rest = input.recv() or return ("", "")
+		loop rest != "" {
+			if rest[0] >= 0x80 {
+				line += rest[..1]
+				rest = rest[1..]
+				continue
+			}
+			parsed, used := keys.key_of(rest)
+			rest = rest[used..]
+			key :: parsed or continue
+			name :: key.names[0]
+			if name == "enter" do return
+			if name in ["esc", "ctrl+c"] do return ("", rest)
+			if name in ["backspace", "ctrl+h"] do line = chop(line)
+			line += key.text
+		}
+	}
+}
 minimized :: fn(win: Window) bool {
 	win.layers.any({ ($.state or "") == "minimized" })
 }
@@ -217,6 +240,15 @@ runs :: fn(cmd: string) Obj {
 	opts: Obj = []
 	if cmd != "" do opts["command"] = ["sh", "-c", cmd]
 	opts
+}
+around :: fn(tree: Json, bid, direction: string) ?Node {
+	node :: json.from_json[Node](tree) or return none
+	split :: node.split or return none
+	if inner := around(split.before, bid, direction) do return inner
+	if inner := around(split.after, bid, direction) do return inner
+	if split.direction != direction do return none
+	if leaves(tree).any({ $.bid == bid }) do return node
+	none
 }
 axis :: fn(dir: string) string { if dir == "left" || dir == "right" do "horizontal" else do "vertical" }
 side :: fn(dir: string) string { if dir == "left" || dir == "up" do "before" else do "after" }
@@ -287,6 +319,8 @@ Client :: struct {
 	conn: rex.Rex
 	sid, cid: string
 	bid, wid: string
+	last_wid: string # for tab.last
+	last_bid: [string]string # for pane.last
 	view: View
 	panes: []Pane
 	chunks: sync.Chan[rex.Chunk]
@@ -402,6 +436,13 @@ Client :< {
 		h :: self.rows - 1
 		win :: self.win()
 		bid :: win.focused_block_id or ""
+		if win.window_id != self.wid && self.wid != "" {
+			self.last_wid = self.wid
+		} else if bid != self.bid && self.bid != "" {
+			last := self.last_bid
+			last[win.window_id] = self.bid
+			self.last_bid = last
+		}
 		self.wid = win.window_id
 		self.bid = bid
 		self.belled = loop wid in self.belled { if wid == self.wid do continue; wid }
@@ -437,6 +478,13 @@ Client :< {
 	win :: fn(self) Window {
 		active :: self.view.active_window_id or ""
 		(self.view.windows or []).find({ $.window_id == active }) or Window.{}
+	}
+
+	layer_of :: fn(self; bid: string) ?Layer {
+		loop layer in self.win().layers; leaf in leaves(layer.layout or :null) {
+			if leaf.bid == bid do return layer
+		}
+		none
 	}
 
 	place :: fn(mut self; leafs: []Leaf, bounds: []float, layer: int) []Pane {
@@ -542,6 +590,15 @@ Client :< {
 	tick :: fn(mut self) {
 		if self.msg != "" && self.msg_at.elapsed() > 3.sec() do self.msg = ""
 		self.draw()
+	}
+
+	ask :: fn(mut self; prompt: string) string {
+		out(reset_modes)
+		self.modes = ""
+		line, rest :: ask(prompt, self.keys, "\e[{self.rows};1H\e[0m\e[2K ", self.unread)
+		self.unread = rest
+		self.redraw()
+		line
 	}
 
 	say :: fn(mut self; msg: string, bad := false) {
@@ -785,6 +842,11 @@ Client :< {
 		dir :: opts.direction or "right"
 		match name {
 			"detach" => return true,
+			"session.rename" => {
+				label :: self.ask("rename session: ")
+				if label != "" do self.ok("session.set_label", ["label" = label])?
+			},
+			"session.close" => self.ok("session.destroy")?,
 			"pane.split" => {
 				pane :: self.focused() or Pane.{}
 				# the longer side, a cell is about twice as tall as wide
@@ -792,13 +854,41 @@ Client :< {
 				shell :: rex.shell(self.here(), runs(opts.command or ""))
 				self.ok("session.new_split", ["direction" = axis(towards), "side" = side(towards), "layout" = shell, "focus" = true])?
 			},
+			"pane.break" => {
+				# Rex won't open an empty window, so a throwaway block holds the place
+				tab :: self.call[NewWindow]("session.new_window", ["layout" = rex.shell()])?
+				self.ok("session.move_block", ["block_id" = self.bid, "anchor_block_id" = tab.block_ids[0]])?
+				self.ok("block.close", ["block_id" = tab.block_ids[0]])?
+			},
 			"pane.close" => self.ok("block.close", ["block_id" = self.bid])?,
 			"pane.zoom" => self.ok("session.zoom_block")?,
+			"pane.resize" => self.resize(dir, opts.cells or 2)?,
+			"pane.swap" => {
+				other :: self.beside(dir) or return error("no pane {dir}")
+				self.ok("session.swap_blocks", ["block_id" = self.bid, "other_block_id" = other.bid])?
+			},
+			"client.detach_others" => loop peer in self.others()? do self.kick(peer)?,
+			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
 			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
+			"pane.last" => self.focus(self.last_bid[self.wid] or return error("no last pane"))?,
+			"pane.next" => self.ok("session.focus_next_pane", ["wrap" = true])?,
 			"tab.new" => self.new_tab(opts.side or "", opts.command or "")?,
+			"client.tab.goto" => {
+				wins :: self.view.windows or []
+				i :: opts.index or return error("client.tab.goto needs an index")
+				at :: if i < 0 do wins.len() + i else do i - 1
+				if at < 0 || at >= wins.len() do return error("no tab {i}")
+				self.ok("session.focus_window", ["window_id" = wins[at].window_id])?
+			},
 			"tab.next" => self.ok("session.focus_next_window", ["wrap" = true])?,
 			"tab.previous" => self.ok("session.focus_previous_window", ["wrap" = true])?,
+			"tab.last" => {
+				if self.last_wid == "" do return error("no last tab")
+				self.ok("session.focus_window", ["window_id" = self.last_wid])?
+			},
+			"tab.move" => self.move_tab(dir == "left")?,
 			"tab.close" => self.ok("session.close_window")?,
+			"tab.rename" => self.rename_tab(self.view.active_window_id or "")?,
 			"client.mode.enter", "client.mode.exit", "client.mode.exit_all" => {
 				if name == "client.mode.enter" {
 					self.modes_on << (opts.name or return error("client.mode.enter needs a name"))
@@ -814,6 +904,11 @@ Client :< {
 		false
 	}
 
+	rename_tab :: fn(mut self; wid: string) ! {
+		label :: self.ask("rename tab: ")
+		if label != "" do self.ok("session.set_window_label", ["window_id" = wid, "label" = label])?
+	}
+
 	new_tab :: fn(mut self; side, cmd: string) ! {
 		tab :: self.call[NewWindow]("session.new_window", ["layout" = rex.shell(self.here(), runs(cmd))])?
 		wins :: self.view.windows or []
@@ -827,8 +922,61 @@ Client :< {
 		}
 	}
 
+	move_tab :: fn(mut self; left: bool) ! {
+		active :: self.view.active_window_id or ""
+		wins :: self.view.windows or []
+		count :: wins.len()
+		i := 0
+		loop win, j in wins {
+			if win.window_id == active do i = j
+		}
+		others: []Window = loop win in wins { if win.window_id == active do continue; win }
+		at :: (i + count + if left do -1 else do 1) % count
+		args: Obj = ["window_id" = active]
+		if at < others.len() do args["before_window_id"] = others[at].window_id
+		self.ok("session.move_window", args)?
+	}
+
 	here :: fn(mut self) string {
 		rex.cwd(self.tcall[Process](self.bid, "process") or Process.{})
+	}
+
+	resize :: fn(mut self; dir: string, by: int) ! {
+		across :: dir == "left" || dir == "right"
+		layer :: self.layer_of(self.bid) or return error("no pane")
+		node :: around(layer.layout or :null, self.bid, if across do "horizontal" else do "vertical") or return error("nothing to resize against")
+		split :: node.split or return error("no split")
+		cells :: if across do float.(self.cols) * node.rect[2] else do float.(self.areas[0].h) * node.rect[3]
+		step :: float.(by) / max(cells, 1.0) * if dir == "left" || dir == "up" do -1.0 else do 1.0
+		self.ratio(split, clamp(split.ratio + step, 0.05, 0.95))?
+	}
+
+	ratio :: fn(mut self; split: Split, to: float) ! {
+		self.ok("session.resize_pane", [
+			"direction" = split.direction, "ratio" = to,
+			"before_block_id" = leaves(split.before)[0].bid, "after_block_id" = leaves(split.after)[0].bid,
+		])?
+	}
+
+	beside :: fn(self; dir: string) ?Pane {
+		focus :: self.focused() or return none
+		across :: dir == "left" || dir == "right"
+		loop pane in self.panes {
+			if pane.layer != focus.layer || pane.bid == focus.bid do continue
+			touches :: match dir {
+				"left" => pane.x + pane.w + 1 == focus.x,
+				"right" => focus.x + focus.w + 1 == pane.x,
+				"up" => pane.y + pane.h + 1 == focus.y,
+				else => focus.y + focus.h + 1 == pane.y,
+			}
+			overlaps :: if across {
+				pane.y < focus.y + focus.h && focus.y < pane.y + pane.h
+			} else {
+				pane.x < focus.x + focus.w && focus.x < pane.x + pane.w
+			}
+			if touches && overlaps do return pane
+		}
+		none
 	}
 
 	requested :: fn(mut self; body: Body) !bool {
@@ -866,6 +1014,10 @@ Client :< {
 	write :: fn(mut self; data: string) ! {
 		if data == "" do return ()
 		self.term(self.bid, "write", ["data" = data])?
+	}
+
+	focus :: fn(mut self; bid: string) ! {
+		self.ok("session.focus_block", ["block_id" = bid])?
 	}
 
 	term :: fn(mut self; bid, method: string, args: Obj) ! {

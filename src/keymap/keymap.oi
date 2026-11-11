@@ -5,14 +5,27 @@ use json.{ Json, Obj }
 pub REQUEST :: r"""{
 	"actions": [
 		{"name": "detach", "kind": "client", "title": "Detach"},
+		{"name": "session.rename", "kind": "client", "title": "Rename Session"},
+		{"name": "session.close", "kind": "client", "title": "Close Session"},
 		{"name": "pane.split", "kind": "client", "title": "Split Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
+		{"name": "pane.break", "kind": "client", "title": "Break Pane to Tab"},
 		{"name": "pane.close", "kind": "client", "title": "Close Pane"},
 		{"name": "pane.zoom", "kind": "client", "title": "Zoom Pane"},
 		{"name": "pane.focus", "kind": "client", "title": "Focus Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
+		{"name": "pane.resize", "kind": "client", "title": "Resize Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
+		{"name": "pane.next", "kind": "client", "title": "Next Pane"},
+		{"name": "pane.last", "kind": "client", "title": "Last Pane"},
+		{"name": "client.detach_others", "kind": "client", "title": "Detach Other Clients"},
+		{"name": "client.config.reload", "kind": "client", "title": "Reload Config"},
+		{"name": "pane.swap", "kind": "client", "title": "Swap Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
 		{"name": "tab.new", "kind": "client", "title": "New Tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
 		{"name": "tab.next", "kind": "client", "title": "Next Tab"},
 		{"name": "tab.previous", "kind": "client", "title": "Previous Tab"},
+		{"name": "tab.last", "kind": "client", "title": "Last Tab"},
+		{"name": "client.tab.goto", "kind": "client", "title": "Go to Tab", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
+		{"name": "tab.move", "kind": "client", "title": "Move Tab", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "left"]}}}},
 		{"name": "tab.close", "kind": "client", "title": "Close Tab"},
+		{"name": "tab.rename", "kind": "client", "title": "Rename Tab"},
 		{"name": "client.mode.enter", "kind": "client", "title": "Enter Mode", "args": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 		{"name": "client.mode.exit", "kind": "client", "title": "Exit Mode"},
 		{"name": "client.mode.exit_all", "kind": "client", "title": "Exit All Modes"}
@@ -24,7 +37,7 @@ pub Action :: struct { pub name: string, pub title: ?string }
 pub Config :: struct { pub hash: string }
 pub Mode :: struct { pub name: string, pub exclusive: bool, pub blocked: ?[][]string }
 
-pub Args :: struct { pub direction: ?string, pub name: ?string, pub side: ?string, pub command: ?string }
+pub Args :: struct { pub direction: ?string, pub name: ?string, pub cells: ?int, pub side: ?string, pub command: ?string, pub index: ?int }
 
 pub Keymap :: struct { pub bindings: []Binding, pub actions: ?[]Action, pub modes: ?[]Mode, pub config: Config }
 
