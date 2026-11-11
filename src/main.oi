@@ -42,16 +42,39 @@ cli :: fn(args: []string) ! {
 		args = args[2..]
 	}
 	autostart(sock)
-	if args.len() > 0 && args[0] in ["help", "-h", "--help"] {
-		print(usage)
-		return ()
+	cmd := if args.len() > 0 do args[0] else do ""
+	match cmd {
+		"ls" => {
+			if "-j" in args || "--json" in args do proxy(sock, "session ls --json", [])
+			conn := rex.connect(sock)?
+			loop session in conn.call[Sessions]("session.list")?.sessions do print(session.label)
+			return ()
+		},
+		"kill" => proxy(sock, "kill", args[1..]),
+		"rename" => proxy(sock, "session rename", args[1..]),
+		"help", "-h", "--help" => {
+			print(usage)
+			return ()
+		},
+		else => {},
 	}
+	readonly, detached, alone :: "-r" in args, "-d" in args, "-D" in args
+	args = args.filter { $ !in ["-r", "-d", "-D"] }
+	cmd = if args.len() > 0 do args[0] else do ""
+	warp :: cmd in ["w", "warp"]
+	needs_name :: warp || cmd in ["j", "join"]
+	if needs_name do args = args[1..]
 	label :: named(args)
-	if args.len() > 1 || label.starts_with("-") {
+	if args.len() > 1 || label.starts_with("-") || !(cmd in ["", "."] || needs_name) || needs_name && args.len() == 0 {
 		eprint(usage)
 		os.exit(2)
 	}
-	run(sock, label)
+	if detached do proxy(sock, "new", [label, "--cwd", if warp do zoxide(label)? else do os.cwd()]) # like tmux new -d
+	# only a bare . renames, a flag means attach or create
+	if cmd == "." && !readonly && !detached && !alone && (os.env("REX_SESSION") or "") != "" {
+		proxy(sock, "session rename", [label])
+	}
+	run(sock, label, warp, readonly, alone)
 }
 
 named :: fn(args: []string) string {
@@ -61,13 +84,34 @@ named :: fn(args: []string) string {
 
 usage :: "rx, a Rex TUI client
 
-usage: rx [-S server] [name]
+usage: rx [-S server] [command] [flags]
 
-create/join session name in current dir. name is a session label or id,
-or . for the cwd's name, the default.
+commands:
+  .                    create/join session named after cwd
+                       inside a session with no flags, renames it instead
+  j, join name         create/join session in current dir
+  w, warp name         create/join session after warping to the given dir (needs zoxide)
+  ls [-j, --json]      list sessions
+  rename [session] name
+                       rename a session, the current one by default
+  kill name...         kill sessions
+  help                 show this
 
 flags:
-  -S server   unix socket or host:port, default $REX_SERVER"
+  -r          read-only
+  -d          don't attach
+  -D          detach other clients
+  -S server   unix socket or host:port, default $REX_SERVER
+
+name is a session label or id, . means the cwd's name"
+
+proxy :: fn(sock, cmd: string, rest: []string) {
+	rest.map(quote)
+		|> $.join(" ")
+		|> os.sh("rex -S {quote(sock)} {cmd} " + $)
+		|> int.($)
+		|> os.exit($)
+}
 
 autostart :: fn(sock: string) {
 	path :: if sock.starts_with("unix://") do sock[7..] else do sock
@@ -90,7 +134,24 @@ out :: fn(text: string) {
 	}
 }
 
-run :: fn(sock, label: string) ! {
+popen : fn(cmd: cstr, mode: cstr) ptr : foreign
+pclose : fn(f: ptr) i32 : foreign
+
+# popen by hand, os.sh keeps no output
+zoxide :: fn(query: string) !string {
+	file :: unsafe popen("zoxide query -- {quote(query)} 2>/dev/null".cstr(), "r".cstr())
+	if file.is_null() do return error("cannot run zoxide")
+	out: []u8
+	loop {
+		byte :: unsafe libc.fgetc(file)
+		if byte < 0 do break
+		out << u8.(byte)
+	}
+	if unsafe pclose(file) != 0 do return error("zoxide: no match for {query}")
+	string.(out).trim()
+}
+
+run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 	conn := rex.connect(sock)?
 	defer conn.close()
 	term :: tty.raw(0)?
@@ -106,17 +167,18 @@ run :: fn(sock, label: string) ! {
 	}
 	# it would draw itself inside itself forever
 	if sid != "" && sid == (os.env("REX_SESSION") or "") do return error("already in {label}")
-	if sid == "" {
-		sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = [["layout" = rex.shell(os.cwd())]]])?.session_id
-	}
+	if sid == "" do sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = [["layout" = rex.shell(if warp do zoxide(label)? else do os.cwd())]]])?.session_id
 	att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
 	view := att.view
 	if (view.windows or []).len() == 0 {
 		discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
 		view = conn.call[View]("session.view", ["session_id" = sid])?
 	}
-	client := Client.{ conn = conn, sid = sid, cid = att.client_id, owned = true, chunks = sync.Chan[rex.Chunk].{}, keys = input }
+	client := Client.{ conn = conn, sid = sid, cid = att.client_id, owned = !readonly, readonly = readonly, chunks = sync.Chan[rex.Chunk].{}, keys = input }
 	client.load_keymap()?
+	if alone {
+		loop peer in client.others()? do client.kick(peer) or {} # like tmux attach -d
+	}
 	client.apply(view)?
 	client.serve(resizes) or {
 		client.close()
@@ -211,7 +273,7 @@ Client :: struct {
 	streams, cols, rows, revision, peers: int
 	modes: string
 	owned: bool
-	full: bool
+	full, readonly: bool
 	km: keymap.Keymap
 	can, ours: [string]()
 	hash: string
@@ -463,6 +525,7 @@ Client :< {
 		line := "\e[{self.rows};1H\e[?7l\e[0m\e[2K" + pill + label
 		plain := label
 		modes: []string = loop mode in self.modes_on do mode
+		if self.readonly do modes << "ro"
 		if self.peers > 0 do modes << "+{self.peers} attached"
 		loop mode in modes {
 			line += "\e[0;1;35m {mode}"
@@ -608,6 +671,10 @@ Client :< {
 		loop peer in self.call[Clients]("session.list_clients")?.clients or [] { if (peer.client_id or "") == self.cid do continue; peer }
 	}
 
+	kick :: fn(mut self; peer: Peer) ! {
+		self.ok("client.perform", ["client_id" = peer.client_id or "", "action" = "detach", "timeout_ms" = 3000.0])?
+	}
+
 	act :: fn(mut self; name: string, args: ?Json) !bool {
 		empty: Obj = []
 		opts :: json.from_json[keymap.Args](args or { empty }) or keymap.Args.{}
@@ -683,6 +750,7 @@ Client :< {
 	}
 
 	own :: fn(mut self) {
+		if self.readonly do return
 		ids: []Json = loop pane in self.panes do Json.(pane.bid)
 		self.ok("session.own_block", ["block_ids" = ids]) or return
 		loop pane in self.panes {
@@ -697,6 +765,7 @@ Client :< {
 	}
 
 	term :: fn(mut self; bid, method: string, args: Obj) ! {
+		if self.readonly do return ()
 		discard self.tcall[Ok](bid, method, args)?
 	}
 
