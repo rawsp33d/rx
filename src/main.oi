@@ -9,17 +9,22 @@ use json
 use math.{ min, max }
 use json.{ Json, Obj }
 use rex
-use rex.{ Sessions, View, Window, Attached, Created, NewWindow, Ok, Process, Rex1, Outer, Body, Leaf, leaves, cell }
+use rex.{ Sessions, View, Window, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
 use strip
 use keys
 use keymap
 use ghostty
 use layout.{ Area }
+use encoding.base64
 
 Done :: struct { client_actions: ?[]keymap.Binding }
 Clients :: struct { clients: ?[]Peer }
 Peer :: struct { client_id: ?string }
 
+Clip :: struct { text: ?string, id: ?int, bytes: ?int }
+Part :: struct { data: string, eof: bool }
+Note :: struct { title: string, body: string }
+Title :: struct { title: string }
 
 reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
 
@@ -105,6 +110,11 @@ flags:
 
 name is a session label or id, . means the cwd's name"
 
+default_label :: fn(win: Window) bool {
+	label :: win.label or ""
+	label.starts_with("Window ") && win.window_id.ends_with(label[7..])
+}
+
 proxy :: fn(sock, cmd: string, rest: []string) {
 	rest.map(quote)
 		|> $.join(" ")
@@ -189,6 +199,18 @@ run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 
 minimized :: fn(win: Window) bool {
 	win.layers.any({ ($.state or "") == "minimized" })
+}
+
+command :: fn(fg: ?Proc) string {
+	proc :: fg or return ""
+	name :: fs.Path.(proc.script or proc.argv0 or proc.name).name()
+	if name.starts_with("-") do name[1..] else do name # a login shell's -zsh
+}
+
+# so a program's text can't sneak in escapes
+printable :: fn(text: string) string {
+	out: []u8 = loop i in 0..text.len() { if text[i] < 0x20 || text[i] == 0x7f do continue; text[i] }
+	string.(out)
 }
 
 runs :: fn(cmd: string) Obj {
@@ -284,6 +306,8 @@ Client :: struct {
 	msg, shown: string
 	msg_at: time.Instant
 	bad: bool
+	fg, named: [string]string
+	belled: []string
 }
 
 Client :< {
@@ -316,7 +340,57 @@ Client :< {
 
 	apply :: fn(mut self; view: View) ! {
 		self.view = view
+		self.fetch_status()
 		self.relayout()?
+	}
+
+	fetch_status :: fn(mut self) {
+		fg := self.fg # can't index assign a field's map
+		loop win in self.view.windows or [] {
+			bid :: win.focused_block_id or ""
+			if bid != "" && bid !in fg {
+				fg[bid] = (self.tcall[Process](bid, "process") or Process.{}) |> command($.foreground)
+			}
+		}
+		self.fg = fg
+	}
+
+	read_clip :: fn(mut self; bid: string, id: int) string {
+		text := ""
+		loop {
+			args: Obj = ["id" = float.(id), "offset" = float.(text.len()), "max_bytes" = 983040.0]
+			part :: self.tcall[Part](bid, "clipboard_read", args) or return ""
+			text += part.data
+			if part.eof || part.data == "" do return text
+		}
+	}
+
+	block_event :: fn(mut self; change: Change) {
+		bid :: change.block_id or ""
+		name :: change.name or ""
+		payload :: change.payload or :null
+		if name == "bell" do self.bell(bid)
+		if name == "clipboard_written" {
+			clip :: json.from_json[Clip](payload) or Clip.{}
+			text :: clip.text or if (clip.bytes or 0) > 0 do self.read_clip(bid, clip.id or 0) else do ""
+			if text != "" do out("\e]52;c;{base64.encode(text)}\a")
+		}
+		if name == "desktop_notification" {
+			note :: json.from_json[Note](payload) or return
+			title :: if note.title != "" do note.title else do self.view.label or "rx"
+			out("\e]777;notify;" + printable(title).replace(";", ",") + ";" + printable(note.body) + "\a")
+		}
+		if name == "title_changed" {
+			named := self.named
+			named[bid] = (json.from_json[Title](payload) or Title.{}).title
+			self.named = named
+		}
+		if name == "process_changed" {
+			fg := self.fg
+			fg[bid] = command((json.from_json[Process](payload) or Process.{}).foreground)
+			self.fg = fg
+		}
+		self.draw()
 	}
 
 	relayout :: fn(mut self) ! {
@@ -330,6 +404,7 @@ Client :< {
 		bid :: win.focused_block_id or ""
 		self.wid = win.window_id
 		self.bid = bid
+		self.belled = loop wid in self.belled { if wid == self.wid do continue; wid }
 		tiled := ""
 		loop layer in win.layers {
 			if layer.kind == "tiled" do tiled = layer.layer_id or ""
@@ -537,8 +612,8 @@ Client :< {
 		wins :: self.view.windows or []
 		loop i in 0..wins.len() {
 			win :: wins[i]
-			name :: win.label or ""
-			flags :: (if win.zoomed_block_id != none do " Z" else do "") + if minimized(win) do " M" else do ""
+			name :: self.tab_name(win)
+			flags :: (if win.zoomed_block_id != none do " Z" else do "") + (if minimized(win) do " M" else do "") + if win.window_id in self.belled do " !" else do ""
 			current :: win.window_id == active
 			line += (if current do "\e[0;30;42m " else do "\e[0m ") + "{i + 1}" + (if name != "" do " " + name else do "") + (if current do "" else do "\e[33m") + flags + " "
 			plain += " {i + 1}" + (if name != "" do " " + name else do "") + flags + " "
@@ -562,6 +637,34 @@ Client :< {
 		line + "\e[0m\e[?7h"
 	}
 
+	tab_name :: fn(self; win: Window) string {
+		if !default_label(win) do return win.label or ""
+		bid :: win.focused_block_id or ""
+		cmd, title :: self.fg[bid] or "", printable(self.named[bid] or "")
+		# like #{b:pane_current_path}
+		title :: if title.starts_with("/") || title.starts_with("~") {
+			fs.Path.(title).name()
+		} else {
+			title
+		}
+		match {
+			title == "" || title == cmd => cmd,
+			cmd == "" => cut(title, 24),
+			else => cmd + ": " + cut(title, 24),
+		}
+	}
+
+	bell :: fn(mut self; bid: string) {
+		out("\a")
+		loop win in self.view.windows or [] {
+			if win.window_id == self.wid || win.window_id in self.belled do continue
+			loop layer in win.layers; leaf in leaves(layer.layout or :null) {
+				if leaf.bid == bid do self.belled << win.window_id
+			}
+		}
+		self.draw()
+	}
+
 	event :: fn(mut self; raw: Json) !bool {
 		outer :: json.from_json[Outer](raw) or return false
 		if outer.type == "session_destroyed" do return true
@@ -571,6 +674,7 @@ Client :< {
 		if outer.type == "client_perform_requested" do return self.requested(outer.payload)
 		ev :: outer.payload.event or return false
 		change :: ev.payload
+		if ev.type == "block_event" do self.block_event(change)
 		if ev.type in ["client_connected", "client_disconnected"] {
 			self.peers = (self.others() or []).len()
 			self.draw()
@@ -791,4 +895,18 @@ wcwidth : fn(c: i32) i32 : foreign
 cells :: fn(text: string) width: int {
 	loop char in text.runes() do width += max(unsafe wcwidth(i32.(char)), 0)
 	return
+}
+fit :: fn(text: string, width: int) string {
+	out := ""
+	used := 0
+	loop char in text.runes() {
+		used += cells(char.str())
+		if used > width do break
+		out += char.str()
+	}
+	out
+}
+
+cut :: fn(text: string, width: int) string {
+	if cells(text) > width do fit(text, width - 1) + "…" else do text
 }
