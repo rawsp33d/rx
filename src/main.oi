@@ -9,18 +9,20 @@ use json
 use math.{ min, max, clamp }
 use json.{ Json, Obj }
 use rex
-use rex.{ Sessions, View, Window, Layer, Node, Split, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
+use rex.{ Sessions, Session, View, Window, Layer, Node, Split, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
 use strip
 use keys
 use keymap
 use ghostty
-use prompt.{ chop }
+use prompt.{ chop, fuzzy }
 use layout.{ Area }
 use encoding.base64
 
 Done :: struct { client_actions: ?[]keymap.Binding }
 Clients :: struct { clients: ?[]Peer }
-Peer :: struct { client_id: ?string }
+Peer :: struct { client_id: ?string, principal: Principal, info: ?Info, connection_state: ?string }
+Principal :: struct { display: string }
+Info :: struct { name: ?string, version: ?string, label: ?string }
 
 Clip :: struct { text: ?string, id: ?int, bytes: ?int }
 Part :: struct { data: string, eof: bool }
@@ -70,12 +72,12 @@ cli :: fn(args: []string) ! {
 	warp :: cmd in ["w", "warp"]
 	needs_name :: warp || cmd in ["j", "join"]
 	if needs_name do args = args[1..]
-	label :: named(args)
+	label :: if args.len() > 0 do named(args) else do "" # "" picks one
 	if args.len() > 1 || label.starts_with("-") || !(cmd in ["", "."] || needs_name) || needs_name && args.len() == 0 {
 		eprint(usage)
 		os.exit(2)
 	}
-	if detached do proxy(sock, "new", [label, "--cwd", if warp do zoxide(label)? else do os.cwd()]) # like tmux new -d
+	if detached && label != "" do proxy(sock, "new", [label, "--cwd", if warp do zoxide(label)? else do os.cwd()]) # like tmux new -d
 	# only a bare . renames, a flag means attach or create
 	if cmd == "." && !readonly && !detached && !alone && (os.env("REX_SESSION") or "") != "" {
 		proxy(sock, "session rename", [label])
@@ -93,6 +95,7 @@ usage :: "rx, a Rex TUI client
 usage: rx [-S server] [command] [flags]
 
 commands:
+  (none)               interactive session browser
   .                    create/join session named after cwd
                        inside a session with no flags, renames it instead
   j, join name         create/join session in current dir
@@ -172,32 +175,167 @@ run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 	resizes :: tty.resizes(1)
 
 	label := label
-	sid := ""
-	loop session in conn.call[Sessions]("session.list")?.sessions {
-		if session.label == label || session.session_id == label do sid, label = session.session_id, session.label
-	}
-	# it would draw itself inside itself forever
-	if sid != "" && sid == (os.env("REX_SESSION") or "") do return error("already in {label}")
-	if sid == "" do sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = [["layout" = rex.shell(if warp do zoxide(label)? else do os.cwd())]]])?.session_id
-	att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
-	view := att.view
-	if (view.windows or []).len() == 0 {
-		discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
-		view = conn.call[View]("session.view", ["session_id" = sid])?
-	}
-	client := Client.{ conn = conn, sid = sid, cid = att.client_id, owned = !readonly, readonly = readonly, chunks = sync.Chan[rex.Chunk].{}, keys = input }
-	client.load_keymap()?
-	if alone {
-		loop peer in client.others()? do client.kick(peer) or {} # like tmux attach -d
-	}
-	client.apply(view)?
-	client.pump(resizes) or {
+	dir := if warp do zoxide(label)? else do ""
+	choose := label == ""
+	cur, prev := "", "" # for session.last
+	loop {
+		sessions :: conn.call[Sessions]("session.list")?.sessions
+		if choose do label, dir = pick(sock, sessions, input, label)
+		if label == "" do break
+		sid := ""
+		if session := sessions.find({ $.label == label || $.session_id == label }) {
+			sid, label = session.session_id, session.label
+		}
+		# it would draw itself inside itself forever
+		if sid != "" && sid == (os.env("REX_SESSION") or "") do return error("already in {label}")
+		if sid == "" do sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = [["layout" = rex.shell(if dir != "" do dir else do os.cwd())]]])?.session_id
+		if sid != cur do prev, cur = cur, sid
+		att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
+		view := att.view
+		if (view.windows or []).len() == 0 {
+			discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
+			view = conn.call[View]("session.view", ["session_id" = sid])?
+		}
+		client := Client.{ conn = conn, sock = sock, sid = sid, cid = att.client_id, owned = !readonly, readonly = readonly, prev = prev, chunks = sync.Chan[rex.Chunk].{}, keys = input }
+		client.load_keymap()?
+		# like tmux attach -d
+		if alone {
+			loop peer in client.others()? do client.kick(peer) or {}
+		}
+		client.apply(view)?
+		client.pump(resizes) or {
+			client.close()
+			conn = client.conn
+			return $
+		}
 		client.close()
 		conn = client.conn
-		return $
+		if !client.choose && client.next == "" do break
+		choose = client.next == ""
+		label, dir = if client.next != "" do (client.next, client.dir) else do (label, "")
+		discard conn.call[Ok]("session.detach", ["session_id" = sid]) or Ok.{}
 	}
-	client.close()
-	conn = client.conn
+}
+
+pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: string) (string, string) {
+	sessions := sessions
+	i := 0
+	loop session, j in sessions {
+		if session.label == at do i = j
+	}
+	bad := ""
+	bottom :: "\e[999;1H\e[0m\e[2K "
+	cmds :: [("alt+enter", "new"), ("ctrl+w", "warp"), ("ctrl+r", "rename"), ("ctrl+x", "close"), ("alt+up", "move up"), ("alt+down", "move down")]
+	rest := ""
+	loop {
+		out("\e[0m\e[H\e[2J" + bottom + "\e[31m{bad}\e[0m")
+		bad = ""
+		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds)
+		rest = more
+		if picked >= 0 do i = picked
+		if name in ["", "esc", "ctrl+c"] {
+			# back to the session it was opened from, if that's still around
+			if name != "" && sessions.any({ $.label == at }) do return (at, "")
+			return ("", "")
+		}
+		if name == "alt+enter" || name == "enter" && picked < 0 {
+			if query != "" do return (query, "")
+			continue
+		}
+		if name == "ctrl+w" {
+			if query == "" {
+				bad = "type where to warp first"
+				continue
+			}
+			return (query, zoxide(query) or { bad = $.message(); continue })
+		}
+		if picked < 0 do continue
+		id :: sessions[picked].session_id
+		if name == "enter" do return (sessions[picked].label, "")
+		if name == "ctrl+r" {
+			label, after :: ask("rename {sessions[picked].label}: ", input, bottom, rest)
+			rest = after
+			if label != "" {
+				args: Obj = ["session_id" = id, "label" = label]
+				sessions = manage(sock, "session.set_label", args) or { bad = $.message(); sessions }
+			}
+		}
+		if name == "ctrl+x" {
+			out(bottom + "close {sessions[picked].label}? y to confirm")
+			typed :: if rest != "" do rest else do input.recv() or return ("", "")
+			answer :: keys.key_of(typed).0 or continue
+			if answer.names[0] == "y" {
+				sessions = manage(sock, "session.destroy", ["session_id" = id]) or { bad = $.message(); sessions }
+			}
+			rest = ""
+		}
+		if name == "alt+down" && picked + 1 < sessions.len() {
+			args: Obj = ["session_id" = id]
+			if picked + 2 < sessions.len() do args["before_session_id"] = sessions[picked + 2].session_id
+			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
+			i += 1
+		}
+		if name == "alt+up" && picked > 0 {
+			args: Obj = ["session_id" = id, "before_session_id" = sessions[picked - 1].session_id]
+			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
+			i -= 1
+		}
+	}
+}
+
+choose :: fn(
+	title: string, items: []string, input: sync.Chan[string], pending: string, at := 0, cmds: [](string, string) = [],
+) (picked: int, name, query, rest: string) {
+	picked, rest = -1, pending
+	size :: tty.size(1) or return
+	cols, rows :: int.(size.cols), int.(size.rows)
+	w :: min(cols - 2, 60)
+	shortcuts := [("enter", "pick")]
+	shortcuts << cmds << ("esc", "cancel")
+	foot :: legend(shortcuts, w - 2)
+	visible :: max(min(items.len(), rows - 6 - foot.len()), 1)
+	x, y :: (cols - w - 2) / 2, max((rows - visible - foot.len() - 6) / 2, 0)
+	i := at
+	loop {
+		picked, name = -1, ""
+		hits: []int = loop item, k in items { if !fuzzy(query, item) do continue; k }
+		i = clamp(i, 0, max(hits.len() - 1, 0))
+		off :: max(i - visible + 1, 0)
+		shown: []string = loop k in 0..visible {
+			if k + off < hits.len() do items[hits[k + off]] else do ""
+		}
+		on :: if hits.len() > 0 do i - off else do -1
+		out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> " + query], foot))
+		out("\e[{y + 2};{x + 5 + cells(query)}H\e[?25h\e[?2026l")
+
+		if rest == "" do rest = input.recv() or return
+		if rest[0] >= 0x80 {
+			query += rest[..1]
+			rest = rest[1..]
+			continue
+		}
+		parsed, used := keys.key_of(rest)
+		rest = rest[used..]
+		key :: parsed or continue
+		if key.action != "press" do continue
+		name = key.names[0]
+		if name in ["esc", "ctrl+c"] do return
+		if i < hits.len() do picked = hits[i]
+		if name == "enter" || cmds.any({ $.0 == name }) do return
+
+		if name in ["down", "ctrl+n", "tab"] do i += 1
+		if name in ["up", "ctrl+p", "shift+tab"] do i = max(i - 1, 0)
+		if name in ["backspace", "ctrl+h"] do query = chop(query)
+		if key.text != "" && name != "tab" do query, i = query + key.text, 0
+	}
+}
+
+manage :: fn(sock, method: string, payload: Obj) ![]Session {
+	conn := rex.connect(sock)?
+	defer conn.close()
+	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
+	discard conn.call[Ok](method, payload)?
+	conn.call[Sessions]("session.list")?.sessions
 }
 
 ask :: fn(prompt: string, input: sync.Chan[string], at: string, pending := "") (line, rest: string) {
@@ -321,9 +459,9 @@ Pane :< {
 
 Client :: struct {
 	conn: rex.Rex
-	sid, cid: string
+	sock, sid, cid: string
 	bid, wid: string
-	last_wid: string # for tab.last
+	last_wid, prev: string # for tab.last and session.last
 	last_bid: [string]string # for pane.last
 	view: View
 	panes: []Pane
@@ -334,12 +472,15 @@ Client :: struct {
 	modes: string
 	owned: bool
 	full, readonly: bool
+	choose: bool
+	next, dir: string
 	km: keymap.Keymap
 	can, ours: [string]()
 	hash: string
 	modes_on: []string # innermost last
 	typed: [][]string
 	eaten: []string # keys a binding took, their release and repeats drop too
+	titles: [string]string
 	areas: []Area
 	msg, shown: string
 	msg_at: time.Instant
@@ -889,6 +1030,14 @@ Client :< {
 		if key.code !in self.eaten do self.eaten << key.code
 	}
 
+	choose :: fn(mut self; title: string, items: []string) int {
+		self.modes = ""
+		i, _, _, rest :: choose(title, items, self.keys, self.unread)
+		self.unread = rest
+		self.redraw()
+		i
+	}
+
 	perform :: fn(mut self; binding: keymap.Binding, key: keys.Key) !bool {
 		if binding.action == "client.key.forward" && binding.keys.len() > 0 {
 			prefix: []Json = loop name in binding.keys[..(binding.keys.len() - 1)] do Json.(name)
@@ -905,6 +1054,17 @@ Client :< {
 		false
 	}
 
+	cycle :: fn(mut self; by: int) !bool {
+		sessions :: self.conn.call[Sessions]("session.list")?.sessions
+		if sessions.len() < 2 do return false
+		i := 0
+		loop session, j in sessions {
+			if session.session_id == self.sid do i = j
+		}
+		self.next = sessions[(i + by + sessions.len()) % sessions.len()].label
+		true
+	}
+
 	others :: fn(mut self) ![]Peer {
 		loop peer in self.call[Clients]("session.list_clients")?.clients or [] { if (peer.client_id or "") == self.cid do continue; peer }
 	}
@@ -917,13 +1077,46 @@ Client :< {
 		empty: Obj = []
 		opts :: json.from_json[keymap.Args](args or { empty }) or keymap.Args.{}
 		dir :: opts.direction or "right"
+		title :: self.titles[name] or { name }
 		match name {
 			"detach" => return true,
+			"session.choose" => {
+				self.choose = true
+				return true
+			},
+			"session.new" => {
+				self.next = self.ask("new session: ")
+				return self.next != ""
+			},
+			"session.warp" => {
+				label :: self.ask("warp: ")
+				if label == "" do return false
+				self.dir = zoxide(label)?
+				self.next = label
+				return true
+			},
 			"session.rename" => {
 				label :: self.ask("rename session: ")
 				if label != "" do self.ok("session.set_label", ["label" = label])?
 			},
 			"session.close" => self.ok("session.destroy")?,
+			"session.select" => {
+				id :: opts.session_id or return error("session.select needs a session_id")
+				if wid := opts.window_id {
+					discard manage(self.sock, "session.focus_window", ["session_id" = id, "window_id" = wid])?
+				}
+				if id == self.sid do return false
+				self.next = id
+				return true
+			},
+			"session.last" => {
+				sessions :: self.conn.call[Sessions]("session.list")?.sessions
+				if !sessions.any({ $.session_id == self.prev }) do return error("no last session")
+				self.next = self.prev
+				return true
+			},
+			"session.next" => return self.cycle(1)?,
+			"session.previous" => return self.cycle(-1)?,
 			"pane.split" => {
 				pane :: self.focused() or Pane.{}
 				# the longer side, a cell is about twice as tall as wide
@@ -943,6 +1136,12 @@ Client :< {
 			"pane.swap" => {
 				other :: self.beside(dir) or return error("no pane {dir}")
 				self.ok("session.swap_blocks", ["block_id" = self.bid, "other_block_id" = other.bid])?
+			},
+			"client.choose" => {
+				peers :: self.others()?
+				if peers.len() == 0 do return error("no other client")
+				i :: self.choose(title, loop peer in peers do describe(peer))
+				if i >= 0 do self.kick(peers[i])?
 			},
 			"client.detach_others" => loop peer in self.others()? do self.kick(peer)?,
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
@@ -966,6 +1165,23 @@ Client :< {
 			"tab.move" => self.move_tab(dir == "left")?,
 			"tab.close" => self.ok("session.close_window")?,
 			"tab.rename" => self.rename_tab(self.view.active_window_id or "")?,
+			"tab.choose" => {
+				conn := rex.connect(self.sock)?
+				defer conn.close()
+				discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
+				items, sids, wids := []string.{}, []string.{}, []string.{}
+				loop session in conn.call[Sessions]("session.list")?.sessions {
+					wins :: (conn.call[View]("session.view", ["session_id" = session.session_id]) or continue).windows or []
+					loop i in 0..wins.len() {
+						items << "{session.label} {i + 1} {self.tab_name(wins[i])}"
+						sids << session.session_id
+						wids << wins[i].window_id
+					}
+				}
+				i :: self.choose(title, items)
+				if i < 0 do return false
+				return self.act("session.select", Json.(["session_id" = sids[i], "window_id" = wids[i]]))
+			},
 			"client.mode.enter", "client.mode.exit", "client.mode.exit_all" => {
 				if name == "client.mode.enter" {
 					self.modes_on << (opts.name or return error("client.mode.enter needs a name"))
@@ -1075,6 +1291,11 @@ Client :< {
 		self.ours = keymap.ours()?
 		self.hash = km.config.hash
 		self.typed = []
+		titles: [string]string = .[]
+		all := keymap.declared()?
+		loop action in km.actions or [] do all << action
+		loop action in all do titles[action.name] = action.title or action.name
+		self.titles = titles
 		self.peers = (self.others() or []).len()
 	}
 
@@ -1125,6 +1346,13 @@ cells :: fn(text: string) width: int {
 	loop char in text.runes() do width += max(unsafe wcwidth(i32.(char)), 0)
 	return
 }
+describe :: fn(peer: Peer) string {
+	info :: peer.info or Info.{}
+	line := peer.principal.display + "  " + (info.label or info.name or "?") + " " + (info.version or "")
+	if (peer.connection_state or "") == "lost" do line += "  (lost)"
+	line
+}
+
 fit :: fn(text: string, width: int) string {
 	out := ""
 	used := 0
@@ -1138,4 +1366,50 @@ fit :: fn(text: string, width: int) string {
 
 cut :: fn(text: string, width: int) string {
 	if cells(text) > width do fit(text, width - 1) + "…" else do text
+}
+
+pad :: fn(text: string, width: int) string {
+	text := fit(text, width)
+	loop cells(text)..width do text += " "
+	text
+}
+
+legend :: fn(pairs: [](string, string), width: int) []string {
+	out := []string.{}
+	line := ""
+	loop (key, what) in pairs {
+		entry :: "{key} {what}"
+		if line != "" && cells(line) + 2 + cells(entry) > width {
+			out << line
+			line = ""
+		}
+		line += (if line == "" do "" else do "  ") + entry
+	}
+	if line != "" do out << line
+	out
+}
+
+box :: fn(x, y, w: int, title: string, rows: []string, on := -1, head: []string = [], foot: []string = []) string {
+	rule :: fn(left, right: string) string {
+		line := left
+		loop 0..w do line += "─"
+		line + right
+	}
+	frame := "\e[0m\e[{y + 1};{x + 1}H" + rule("┌", "┐")
+	if title != "" do frame += "\e[{y + 1};{x + 3}H\e[1m " + fit(title, w - 4) + " \e[22m"
+	row := y + 1
+	parts :: [head, rows, foot]
+	loop k in 0..3 {
+		if parts[k].len() == 0 do continue
+		if row > y + 1 {
+			frame += "\e[{row + 1};{x + 1}H" + rule("├", "┤")
+			row += 1
+		}
+		loop i in 0..parts[k].len() {
+			picked :: if k == 1 && i == on do "\e[30;42m" else do ""
+			frame += "\e[{row + 1};{x + 1}H│" + picked + " " + pad(parts[k][i], w - 2) + " \e[0m│"
+			row += 1
+		}
+	}
+	frame + "\e[{row + 1};{x + 1}H" + rule("└", "┘")
 }

@@ -5,6 +5,19 @@ pub chop :: fn(line: string) string {
 	line[..end]
 }
 
+pub fuzzy :: fn(query, text: string) bool {
+	want, have :: query.lower(), text.lower()
+	i := 0
+	loop j in 0..have.len() {
+		if i < want.len() && have[j] == want[i] do i += 1
+	}
+	i == want.len()
+}
+
 test! "chop" {
 	assert! chop("ab") == "a" && chop("aé") == "a" && chop("") == ""
+}
+
+test! "fuzzy" {
+	assert! fuzzy("zp", "Zoom Pane") && !fuzzy("pz", "Zoom Pane")
 }
