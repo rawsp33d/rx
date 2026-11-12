@@ -1,3 +1,5 @@
+use json
+use math.{ min, max, clamp }
 
 pub Area :: struct { pub x: int, pub y: int, pub w: int, pub h: int, pub id: string }
 
@@ -5,4 +7,34 @@ Area :< {
 	pub covers :: fn(self; x, y: int) bool {
 		x >= self.x - 1 && x <= self.x + self.w && y >= self.y - 1 && y <= self.y + self.h
 	}
+}
+
+pub stretch :: fn(bounds: []float, dir: string, by: float) json.Arr {
+	i :: if dir == "left" || dir == "right" do 0 else do 1
+	pos, size := bounds[i], bounds[i + 2]
+	grow :: dir == "right" || dir == "down"
+	if grow && pos + size < 0.999 {
+		size = min(size + by, 1.0 - pos)
+	} else if grow {
+		pos += by
+		size -= by
+	} else if pos > 0.001 {
+		moved :: max(pos - by, 0.0)
+		size += pos - moved
+		pos = moved
+	} else {
+		size -= by
+	}
+	out: json.Arr = [bounds[0], bounds[1], bounds[2], bounds[3]]
+	if size < 0.05 do return out
+	out[i] = pos
+	out[i + 2] = min(size, 1.0 - pos) # float error can push it past the edge
+	out
+}
+
+pub shift :: fn(bounds: []float, dir: string, by: float) json.Arr {
+	i :: if dir == "left" || dir == "right" do 0 else do 1
+	out: json.Arr = [bounds[0], bounds[1], bounds[2], bounds[3]]
+	out[i] = clamp(bounds[i] + if dir == "left" || dir == "up" do -by else do by, 0.0, 1.0 - bounds[i + 2])
+	out
 }

@@ -1,0 +1,9 @@
+use json
+use json.{ Json }
+
+test! "stretch and shift" {
+	bounds :: [0.5, 0.25, 0.5, 0.5]
+	show :: fn(value: json.Arr) string { Json.(value).str() }
+	assert! show(stretch(bounds, "right", 0.25)) == "[0.75,0.25,0.25,0.5]" && show(stretch(bounds, "up", 0.5)) == "[0.5,0,0.5,0.75]"
+	assert! show(shift(bounds, "left", 0.75)) == "[0,0.25,0.5,0.5]" && show(stretch([0.0, 0.0, 0.125, 1.0], "left", 0.125)) == "[0,0,0.125,1]"
+}
