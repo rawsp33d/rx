@@ -25,3 +25,19 @@ test! "find" {
 	assert! action([["z"]], "resize") == "pane.zoom" && action([["ctrl+space"]], "resize") == "detach" && action([["ctrl+g"]], "resize") == ""
 	assert! action([["z"]], "only") == "pane.zoom" && action([["ctrl+space"]], "only") == "drop"
 }
+
+test! "which-key rows" {
+	km :: json.decode[Keymap](r"""{"config": {"hash": ""}, "bindings": [
+		{"keys": ["v", "x"], "action": "pane.close"},
+		{"keys": ["right"], "action": "pane.focus", "args": {"direction": "right"}},
+		{"keys": ["l"], "action": "pane.focus", "args": {"direction": "right"}},
+		{"keys": ["shift+l"], "action": "pane.resize", "args": {"direction": "right", "cells": 5}},
+		{"keys": ["left"], "action": "pane.focus", "args": {"direction": "left"}},
+		{"keys": ["h"], "action": "pane.focus", "args": {"direction": "left"}},
+		{"keys": ["shift+h"], "action": "pane.resize", "args": {"direction": "left", "cells": 5}},
+		{"keys": ["n"], "action": "tab.new", "args": {"side": "after"}}
+	]}""") or panic!($.message())
+	titles: [string]string = ["pane.focus" = "Focus Pane", "pane.resize" = "Resize Pane"]
+	got :: (loop (keys, title) in hint_rows(km.bindings, 0, titles) do "{keys}={title}").join(", ")
+	assert! got == "n=tab.new after, shift+h/l=Resize Pane, h/l=Focus Pane, left/right=Focus Pane, v=…"
+}

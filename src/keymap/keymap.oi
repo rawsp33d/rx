@@ -105,10 +105,64 @@ find :: fn(bindings: []Binding, typed: [][]string, can: [string](), mode: string
 	bindings.find({ ($.mode or "") == mode && $.action in can && matches($.keys, typed) })
 }
 
-matches :: fn(keys: []string, typed: [][]string) bool {
+pub matches :: fn(keys: []string, typed: [][]string) bool {
 	if keys.len() < typed.len() do return false
 	loop i in 0..typed.len() {
 		if keys[i] !in typed[i] do return false
 	}
 	true
+}
+
+# an action's keys for each direction share a row, like h/l
+pub hint_rows :: fn(bindings: []Binding, depth: int, titles: [string]string) [](string, string) {
+	empty: Obj = []
+	keys, labels, bases, dirs := [][]string.{}, []string.{}, []string.{}, []string.{}
+	loop i in 0..bindings.len() {
+		binding :: bindings[bindings.len() - 1 - i]
+		key :: binding.keys[depth]
+		more :: binding.keys.len() > depth + 1
+		args :: json.from_json[Args](binding.args or { empty }) or Args.{}
+		dir :: if more do "" else do (args.direction or "") + " "
+		base :: "{binding.action} {args.cells or 0} " + title_of(binding, titles, false)
+		at := -1
+		if dir != " " {
+			loop j in 0..keys.len() {
+				if at < 0 && bases[j] == base && !dirs[j].contains(dir) do at = j
+			}
+		}
+		if at >= 0 {
+			row := keys[at]
+			row << key
+			keys[at] = row
+			labels[at] = title_of(binding, titles, false)
+			dirs[at] += dir
+			continue
+		}
+		keys << [key]
+		labels << if more do "…" else do title_of(binding, titles)
+		bases << if dir != " " do base else do ""
+		dirs << dir
+	}
+	loop i in 0..keys.len() do (keys_of(keys[i]), labels[i])
+}
+
+keys_of :: fn(keys: []string) string {
+	held :: mods(keys[0])
+	if held == "" || keys.any({ mods($) != held }) do return keys.join("/")
+	held + (loop key in keys do key[held.len()..]).join("/")
+}
+
+mods :: fn(key: string) string {
+	i := key.len() - 2
+	loop i >= 0 && key[i] != '+' do i -= 1
+	key[..i + 1]
+}
+
+title_of :: fn(binding: Binding, titles: [string]string, dir := true) string {
+	empty: Obj = []
+	args :: json.from_json[Args](binding.args or { empty }) or Args.{}
+	detail := args.command or args.side or args.name or ""
+	if dir do detail = args.direction or { detail }
+	if i := args.index do detail = i.str()
+	(titles[binding.action] or binding.action) + if detail != "" do " " + detail else do ""
 }

@@ -484,7 +484,7 @@ Client :: struct {
 	eaten: []string # keys a binding took, their release and repeats drop too
 	titles: [string]string
 	areas: []Area
-	msg, shown: string
+	msg, shown, hinted: string
 	msg_at: time.Instant
 	bad: bool
 	fg, named: [string]string
@@ -759,6 +759,9 @@ Client :< {
 		loop pane in self.panes {
 			if pane.full do all = true
 		}
+		hints :: self.which()
+		if hints != self.hinted do all = true
+		self.hinted = hints
 		frame := "\e[?2026h"
 		if all do frame += "\e[0m\e[H\e[2J"
 		bar :: self.bar()
@@ -790,6 +793,7 @@ Client :< {
 			cursor = seq
 			if self.areas[(pane.layer + 1)..].any({ $.covers(cx, cy) }) do cursor = "\e[?25l"
 		}
+		if hints != "" do frame, cursor = frame + hints, "\e[?25l"
 		self.full = false
 		out(frame + cursor + "\e[?2026l")
 	}
@@ -931,6 +935,74 @@ Client :< {
 		}
 	}
 
+	# TODO: a mode's exclusive and blocked keys
+	hints :: fn(self) [](string, string) {
+		depth :: self.typed.len()
+		mode :: self.modes_on.last() or ""
+		seen: [string]() = .[]
+		bindings: []keymap.Binding = loop binding in self.km.bindings {
+			scope :: binding.mode or ""
+			if binding.keys.len() <= depth || binding.action !in self.can do continue
+			if scope !in [mode, ""] || depth == 0 && scope != mode do continue
+			if !keymap.matches(binding.keys, self.typed) || binding.keys[depth] in seen do continue
+			seen[binding.keys[depth]] = ()
+			binding
+		}
+		keymap.hint_rows(bindings, depth, self.titles)
+	}
+
+	which :: fn(self) string {
+		if self.typed.len() == 0 && self.modes_on.len() == 0 do return ""
+		hints :: self.hints()
+		if hints.len() == 0 do return ""
+		bottom :: self.rows - 1
+		if bottom < 3 do return ""
+		rows, w := []string.{}, 0
+		loop cap in [24, 16, 12] {
+			all := false
+			loop ncols in 1..=hints.len() {
+				nrows :: min((hints.len() + ncols - 1) / ncols, bottom - 2)
+				if (ncols - 1) * nrows >= hints.len() do continue
+				shown := hints
+				room :: ncols * nrows
+				if hints.len() > room {
+					shown = hints[..(room - 1)]
+					shown << ("…", "{hints.len() - room + 1} more")
+				}
+				key_widths, title_widths := []int.{}, []int.{}
+				loop (key, title), i in shown {
+					if i % nrows == 0 {
+						key_widths << 0
+						title_widths << 0
+					}
+					col :: i / nrows
+					key_widths[col] = max(key_widths[col], cells(key))
+					title_widths[col] = max(title_widths[col], min(cells(title), cap))
+				}
+				width := 2 * (key_widths.len() - 1)
+				loop col in 0..key_widths.len() do width += key_widths[col] + 1 + title_widths[col]
+				if ncols > 1 && width > self.cols - 4 do continue
+				w = min(width, self.cols - 4)
+				rows = loop row in 0..nrows {
+					cols :: loop col in 0..key_widths.len() {
+						at :: col * nrows + row
+						if at >= shown.len() do continue
+						pad(shown[at].0, key_widths[col]) + " " + pad(cut(shown[at].1, title_widths[col]), title_widths[col])
+					}
+					cols |> $.join("  ")
+				}
+				all = shown.len() == hints.len()
+			}
+			if all do break
+		}
+		title :: if self.typed.len() > 0 {
+			self.typed.map({ $[0] }) |> $.join(" ")
+		} else {
+			self.modes_on.last() or ""
+		}
+		box(0, bottom - rows.len() - 2, w + 2, title, rows)
+	}
+
 	bell :: fn(mut self; bid: string) {
 		out("\a")
 		loop win in self.view.windows or [] {
@@ -1014,7 +1086,7 @@ Client :< {
 			if self.perform(hit, key) or { self.say($.message(), true); false } do return true
 		}
 		self.write(pass)?
-		if self.bar() != self.shown do self.draw()
+		if self.bar() != self.shown || self.which() != self.hinted do self.draw()
 		false
 	}
 
