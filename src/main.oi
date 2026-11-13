@@ -15,7 +15,7 @@ use keys
 use keymap
 use ghostty
 use prompt.{ chop, fuzzy }
-use layout.{ Area, stretch, shift }
+use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift }
 use encoding.base64
 
 Done :: struct { client_actions: ?[]keymap.Binding }
@@ -503,6 +503,8 @@ Client :: struct {
 	fg, named, labels: [string]string
 	status: [string]string # OSC 7501, by block id, newline, record id
 	seen: [string]()
+	layout: int
+	tiling, tiled_as: [string]string # auto tiling like dvtm, by window
 	belled: []string
 }
 
@@ -582,6 +584,32 @@ Client :< {
 		self.view = view
 		self.fetch_status()
 		self.relayout()?
+		self.retile()?
+	}
+
+	retile :: fn(mut self) ! {
+		name :: self.tiling[self.wid] or return ()
+		bids :: self.tiled()
+		key :: bids.join(" ")
+		if (self.tiled_as[self.wid] or "") == key do return ()
+		tiled_as := self.tiled_as # can't index assign a field's map
+		tiled_as[self.wid] = key
+		self.tiled_as = tiled_as
+		self.arrange(bids, name)?
+	}
+
+	tiled :: fn(self) []string {
+		layer :: self.win().layers.find({ $.kind == "tiled" }) or return []
+		leaves(layer.layout or :null).map({ $.bid })
+	}
+
+	arrange :: fn(mut self; bids: []string, name: string) ! {
+		loop step in arrange(bids, name) {
+			self.ok("session.move_block", [
+				"block_id" = step.bid, "anchor_block_id" = step.anchor,
+				"direction" = step.direction, "side" = "after", "ratio" = step.ratio,
+			])?
+		}
 	}
 
 	fetch_status :: fn(mut self) {
@@ -960,7 +988,7 @@ Client :< {
 			win :: wins[i]
 			name :: self.tab_name(win)
 			flags :: (if win.zoomed_block_id != none do " Z" else do "") + (if minimized(win) do " M" else do "") +
-				(if win.window_id in self.belled do " !" else do "") + marks[urgency(self.win_state(win))]
+				(if win.window_id in self.tiling do " T" else do "") + (if win.window_id in self.belled do " !" else do "") + marks[urgency(self.win_state(win))]
 			current :: win.window_id == active
 			line += (if current do "\e[0;30;42m " else do "\e[0m ") + "{i + 1}" + (if name != "" do " " + name else do "") + (if current do "" else do "\e[33m") + flags + " "
 			plain += " {i + 1}" + (if name != "" do " " + name else do "") + flags + " "
@@ -1277,6 +1305,13 @@ Client :< {
 				self.ok("session.move_block", ["block_id" = self.bid, "anchor_block_id" = tab.block_ids[0]])?
 				self.ok("block.close", ["block_id" = tab.block_ids[0]])?
 			},
+			"pane.rotate" => {
+				layer :: self.layer_of(self.bid) or return error("no pane")
+				bids: []string = loop leaf in leaves(layer.layout or :null) do leaf.bid
+				loop (from, to) in rotation(bids, dir == "up") {
+					self.ok("session.swap_blocks", ["block_id" = from, "other_block_id" = to])?
+				}
+			},
 			"pane.close" => self.ok("block.close", ["block_id" = self.bid])?,
 			"pane.zoom" => self.ok("session.zoom_block")?,
 			"pane.resize" => self.resize(dir, opts.cells or 2)?,
@@ -1361,6 +1396,25 @@ Client :< {
 			},
 			"tab.move" => self.move_tab(dir == "left")?,
 			"tab.close" => self.ok("session.close_window")?,
+			"tab.even" => {
+				layer :: self.layer_of(self.bid) or return error("no pane")
+				loop split in evened(layer.layout or :null) do self.ratio(split, split.ratio)?
+			},
+			"tab.layout" => self.relayout_tab(opts.layout or "next")?,
+			"tab.tile" => {
+				name := opts.layout or "main-vertical"
+				if name !in layouts do return error("no layout {name}")
+				if (self.tiling[self.wid] or "") == name do name = ""
+				tiling: [string]string = .[]
+				loop layout, wid in self.tiling {
+					if wid != self.wid do tiling[wid] = layout
+				}
+				if name != "" do tiling[self.wid] = name
+				self.tiling = tiling
+				self.tiled_as = .[]
+				self.retile()?
+				self.say(if name != "" do "tiling {name}" else do "tiling off")
+			},
 			"tab.rename" => self.rename_tab(self.view.active_window_id or "")?,
 			"tab.choose" => {
 				conn := rex.connect(self.sock)?
@@ -1401,6 +1455,18 @@ Client :< {
 			opts["exit"] = ["quick_exit_threshold_ms" = 0.0]
 		}
 		self.ok("session.new_layer", ["bounds" = popup(), "layout" = rex.shell(self.here(), opts), "focus" = true])?
+	}
+
+	relayout_tab :: fn(mut self; name: string) ! {
+		count :: layouts.len()
+		i :: layouts.index(name) or match name {
+			"next" => (self.layout + 1) % count,
+			"previous" => (self.layout + count - 1) % count,
+			else => return error("no layout {name}"),
+		}
+		self.layout = i
+		self.arrange(self.tiled(), layouts[i])?
+		self.say(layouts[i])
 	}
 
 	rename_tab :: fn(mut self; wid: string) ! {

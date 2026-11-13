@@ -1,5 +1,7 @@
 use json
+use json.{ Json }
 use math.{ min, max, clamp }
+use rex.{ Node, Split }
 
 pub Area :: struct { pub x: int, pub y: int, pub w: int, pub h: int, pub id: string }
 
@@ -37,4 +39,58 @@ pub shift :: fn(bounds: []float, dir: string, by: float) json.Arr {
 	out: json.Arr = [bounds[0], bounds[1], bounds[2], bounds[3]]
 	out[i] = clamp(bounds[i] + if dir == "left" || dir == "up" do -by else do by, 0.0, 1.0 - bounds[i + 2])
 	out
+}
+
+pub layouts :: ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]
+
+pub Move :: struct { pub bid: string, pub anchor: string, pub direction: string, pub ratio: float }
+
+pub arrange :: fn(bids: []string, name: string) []Move {
+	count :: bids.len()
+	if count < 2 do return []
+	if name == "even-horizontal" || name == "even-vertical" do return even(bids, name[5..])
+	if name.starts_with("main-") {
+		# main-vertical puts the main pane left of a column of the rest, main-horizontal above a row
+		across :: if name == "main-vertical" do "horizontal" else do "vertical"
+		out := [Move.{ bid = bids[1], anchor = bids[0], direction = across, ratio = 0.7 }]
+		out << even(bids[1..], if across == "horizontal" do "vertical" else do "horizontal")
+		return out
+	}
+	cols := 1
+	loop cols * cols < count do cols += 1
+	rows: [][]string = loop row in 0..((count + cols - 1) / cols) {
+		bids[(row * cols)..min((row + 1) * cols, count)]
+	}
+	heads: []string = loop row in rows do row[0]
+	out := even(heads, "vertical")
+	loop row in rows do out << even(row, "horizontal")
+	out
+}
+
+even :: fn(bids: []string, direction: string) []Move {
+	loop i in 1..bids.len() {
+		Move.{ bid = bids[i], anchor = bids[i - 1], direction = direction, ratio = 1.0 / float.(bids.len() - i + 1) }
+	}
+}
+
+pub rotation :: fn(bids: []string, up: bool) [](string, string) {
+	count :: bids.len()
+	if count < 2 do return []
+	if up do return loop i in 1..count do (bids[0], bids[i])
+	loop i in 0..(count - 1) do (bids[count - 1], bids[count - 2 - i])
+}
+
+pub evened :: fn(tree: Json) []Split {
+	node :: json.from_json[Node](tree) or return []
+	split := node.split or return []
+	before, after :: span(split.before, split.direction), span(split.after, split.direction)
+	split.ratio = float.(before) / float.(before + after)
+	[split, ..evened(split.before), ..evened(split.after)]
+}
+
+span :: fn(tree: Json, direction: string) int {
+	node :: json.from_json[Node](tree) or return 1
+	split :: node.split or return 1
+	before, after :: span(split.before, direction), span(split.after, direction)
+	if split.direction == direction do before + after else do max(before, after)
 }

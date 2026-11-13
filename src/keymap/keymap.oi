@@ -16,6 +16,7 @@ pub REQUEST :: r"""{
 		{"name": "session.select", "kind": "client", "title": "Select Session", "args": {"type": "object", "properties": {"session_id": {"type": "string"}, "window_id": {"type": "string"}}, "required": ["session_id"]}},
 		{"name": "pane.split", "kind": "client", "title": "Split Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
 		{"name": "pane.break", "kind": "client", "title": "Break Pane to Tab"},
+		{"name": "pane.rotate", "kind": "client", "title": "Rotate Panes", "args": {"type": "object", "properties": {"direction": {"enum": ["down", "up"]}}}},
 		{"name": "pane.close", "kind": "client", "title": "Close Pane"},
 		{"name": "pane.zoom", "kind": "client", "title": "Zoom Pane"},
 		{"name": "pane.focus", "kind": "client", "title": "Focus Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
@@ -45,8 +46,11 @@ pub REQUEST :: r"""{
 		{"name": "client.tab.goto", "kind": "client", "title": "Go to Tab", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
 		{"name": "tab.move", "kind": "client", "title": "Move Tab", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "left"]}}}},
 		{"name": "tab.close", "kind": "client", "title": "Close Tab"},
+		{"name": "tab.even", "kind": "client", "title": "Even Out Panes"},
 		{"name": "tab.rename", "kind": "client", "title": "Rename Tab"},
 		{"name": "tab.choose", "kind": "client", "title": "Choose Tab in Any Session"},
+		{"name": "tab.layout", "kind": "client", "title": "Lay Out Tab", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled", "next", "previous"]}}}},
+		{"name": "tab.tile", "kind": "client", "title": "Auto Tile", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]}}}},
 		{"name": "client.mode.enter", "kind": "client", "title": "Enter Mode", "args": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 		{"name": "client.mode.exit", "kind": "client", "title": "Exit Mode"},
 		{"name": "client.mode.exit_all", "kind": "client", "title": "Exit All Modes"}
@@ -58,7 +62,7 @@ pub Action :: struct { pub name: string, pub title: ?string }
 pub Config :: struct { pub hash: string }
 pub Mode :: struct { pub name: string, pub exclusive: bool, pub blocked: ?[][]string }
 
-pub Args :: struct { pub direction: ?string, pub name: ?string, pub cells: ?int, pub side: ?string, pub command: ?string, pub index: ?int, pub session_id: ?string, pub window_id: ?string }
+pub Args :: struct { pub direction: ?string, pub name: ?string, pub cells: ?int, pub side: ?string, pub command: ?string, pub layout: ?string, pub index: ?int, pub session_id: ?string, pub window_id: ?string }
 
 pub Keymap :: struct { pub bindings: []Binding, pub actions: ?[]Action, pub modes: ?[]Mode, pub config: Config }
 
@@ -164,7 +168,7 @@ mods :: fn(key: string) string {
 title_of :: fn(binding: Binding, titles: [string]string, dir := true) string {
 	empty: Obj = []
 	args :: json.from_json[Args](binding.args or { empty }) or Args.{}
-	detail := args.command or args.side or args.name or ""
+	detail := args.command or args.layout or args.side or args.name or ""
 	if dir do detail = args.direction or { detail }
 	if i := args.index do detail = i.str()
 	(titles[binding.action] or binding.action) + if detail != "" do " " + detail else do ""
