@@ -15,7 +15,7 @@ use keys
 use keymap
 use ghostty
 use prompt.{ chop, fuzzy }
-use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift }
+use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift, border }
 use encoding.base64
 
 Done :: struct { client_actions: ?[]keymap.Binding }
@@ -36,6 +36,11 @@ Records :: struct { records: []Record }
 Removed :: struct { ids: []string }
 
 reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
+
+# one tracking mode clears the others, so keep the program's motion
+mouse_on :: fn(term: ghostty.Term) string {
+	(if term.mode(1003) do "\e[?1003h" else do "\e[?1002h") + "\e[?1006h"
+}
 
 # secs a program may hold a frame (2026)
 hold :: 1
@@ -404,6 +409,95 @@ around :: fn(tree: Json, bid, direction: string) ?Node {
 	if leaves(tree).any({ $.bid == bid }) do return node
 	none
 }
+Drag :: struct {
+	kind: string # split, float, corner, tab, pill, program, eat or ""
+	x, y: int
+	node: Node
+	area: Area
+	id: string
+	bounds: []float
+}
+
+Drag :< {
+	resizing :: fn(self) bool {
+		self.kind in ["split", "float", "corner"]
+	}
+}
+
+moving :: fn(seq: string) bool {
+	_, fin, used := keys.csi(seq)
+	if !seq.starts_with("\e[<") || fin != 'M' do return false
+	button :: sgr(seq[..used]).0
+	button >= 0 && button & 32 != 0
+}
+
+# SGR and X10 only, no 1005 or 1015
+report :: fn(term: ghostty.Term, button, x, y: int, up: bool) string {
+	want :: if button & 32 != 0 {
+		term.mode(1003) || term.mode(1002) && button & 3 != 3
+	} else {
+		term.mode(1000) || term.mode(1002) || term.mode(1003)
+	}
+	if !want do return scroll(term, button)
+	if term.mode(1006) do return "\e[<{button};{x + 1};{y + 1}" + if up do "m" else do "M"
+	if x > 222 || y > 222 do return ""
+	"\e[M" + string.([u8.(32 + if up do button | 3 else do button), u8.(33 + x), u8.(33 + y)])
+}
+
+scroll :: fn(term: ghostty.Term, button: int) string {
+	if button & 98 != 64 || !term.mode(1007) || !(term.mode(1049) || term.mode(1047) || term.mode(47)) {
+		return ""
+	}
+	arrow :: (if term.mode(1) do "\eO" else do "\e[") + if button & 1 == 0 do "A" else do "B"
+	arrow + arrow + arrow # three lines a notch, like wezterm
+}
+
+sgr :: fn(seq: string) (button, x, y: int, up: bool) {
+	fields :: seq[3..(seq.len() - 1)].split(";")
+	if fields.len() != 3 do return (-1, 0, 0, false)
+	button = int.try_from(fields[0]) or 0
+	x = (int.try_from(fields[1]) or 0) - 1
+	y = (int.try_from(fields[2]) or 0) - 1
+	up = seq.ends_with("m")
+	return
+}
+
+Item :: struct { label, key, action: string, args: Obj }
+
+pane_items :: fn() []Item {
+	[
+		Item.{ label = "Split Right", key = "l", action = "pane.split", args = ["direction" = "right"] },
+		Item.{ label = "Split Down", key = "j", action = "pane.split", args = ["direction" = "down"] },
+		Item.{ label = "Zoom", key = "z", action = "pane.zoom" },
+		Item.{ label = "Float", key = "f", action = "layer.float" },
+		Item.{ label = "Close", key = "X", action = "pane.close" },
+	]
+}
+
+tab_items :: fn() []Item {
+	[
+		Item.{ label = "Move Left", key = "<", action = "tab.move", args = ["direction" = "left"] },
+		Item.{ label = "Move Right", key = ">", action = "tab.move", args = ["direction" = "right"] },
+		Item.{ label = "Rename", key = "r", action = "tab.rename" },
+		Item.{ label = "New After", key = "n", action = "tab.new", args = ["side" = "after"] },
+		Item.{ label = "New at End", key = "N", action = "tab.new" },
+		Item.{ label = "Next Layout", key = "w", action = "tab.layout" },
+		Item.{ label = "Close", key = "X", action = "tab.close" },
+	]
+}
+
+session_items :: fn() []Item {
+	[
+		Item.{ label = "Next", key = "l", action = "session.next" },
+		Item.{ label = "Previous", key = "h", action = "session.previous" },
+		Item.{ label = "Choose", key = "s", action = "session.choose" },
+		Item.{ label = "Rename", key = "r", action = "session.rename" },
+		Item.{ label = "New", key = "n", action = "session.new" },
+		Item.{ label = "Warp", key = "w", action = "session.warp" },
+		Item.{ label = "Detach", key = "d", action = "detach" },
+		Item.{ label = "Close", key = "X", action = "session.close" },
+	]
+}
 axis :: fn(dir: string) string { if dir == "left" || dir == "right" do "horizontal" else do "vertical" }
 side :: fn(dir: string) string { if dir == "left" || dir == "up" do "before" else do "after" }
 Pane :: struct {
@@ -485,9 +579,9 @@ Client :: struct {
 	streams, cols, rows, revision, peers: int
 	modes: string
 	owned: bool
-	full, readonly, dim: bool
+	full, readonly, mouse_off, dim: bool
 	frames: bool # like tmux's pane-border-status bottom
-	choose: bool
+	choose, detach: bool
 	next, dir: string
 	km: keymap.Keymap
 	can, ours: [string]()
@@ -505,6 +599,11 @@ Client :: struct {
 	seen: [string]()
 	layout: int
 	tiling, tiled_as: [string]string # auto tiling like dvtm, by window
+	drag: Drag
+	clicks: int
+	click: string
+	click_at: time.Instant
+	tabs: []int
 	belled: []string
 }
 
@@ -562,7 +661,10 @@ Client :< {
 			if self.panes.len() == 0 do break
 			sync.select! {
 				got := <-self.keys => {
-					buf :: got or break :run
+					buf := got or break :run
+					loop self.drag.resizing() {
+						buf += self.keys.try_recv() or break
+					}
 					if self.input(buf)? do break :run
 				},
 				_ := <-resizes => {
@@ -870,7 +972,7 @@ Client :< {
 			pane :: self.panes[i]
 			if pane.bid != self.bid || !pane.painted do continue
 			# always bracket pastes so input can tell them from typing
-			modes :: pane.term.modes() + "\e[?2004h"
+			modes :: pane.term.modes() + "\e[?2004h" + if self.mouse_off do "" else do mouse_on(pane.term)
 			if modes != self.modes {
 				frame += modes
 				self.modes = modes
@@ -984,8 +1086,10 @@ Client :< {
 		plain += " "
 		active :: self.view.active_window_id or ""
 		wins :: self.view.windows or []
-		loop i in 0..wins.len() {
-			win :: wins[i]
+		tabs := []int.{}
+		loop win, i in wins {
+			tabs << cells(plain)
+			wid :: win.window_id
 			name :: self.tab_name(win)
 			flags :: (if win.zoomed_block_id != none do " Z" else do "") + (if minimized(win) do " M" else do "") +
 				(if win.window_id in self.tiling do " T" else do "") + (if win.window_id in self.belled do " !" else do "") + marks[urgency(self.win_state(win))]
@@ -993,6 +1097,8 @@ Client :< {
 			line += (if current do "\e[0;30;42m " else do "\e[0m ") + "{i + 1}" + (if name != "" do " " + name else do "") + (if current do "" else do "\e[33m") + flags + " "
 			plain += " {i + 1}" + (if name != "" do " " + name else do "") + flags + " "
 		}
+		tabs << cells(plain)
+		self.tabs = tabs
 		clock :: " " + time.Time.now().format("%H:%M") + " "
 		left :: cells(plain) + 1
 		end := self.cols
@@ -1146,6 +1252,15 @@ Client :< {
 		self.unread += data
 		loop self.unread != "" {
 			buf :: self.unread
+			_, fin, seq_len := keys.csi(buf)
+			if buf.starts_with("\e[<") && (fin == 'M' || fin == 'm') {
+				self.unread = buf[seq_len..]
+				# a resize is a round trip, only the last motion needs one
+				if self.drag.resizing() && moving(buf) && moving(self.unread) do continue
+				pass += self.mouse(buf[..seq_len])?
+				if self.detach do return true
+				continue
+			}
 			if buf.starts_with("\e[200~") {
 				# a paste skips the keymap, or its newlines would be ctrl+j
 				body :: buf[6..].split("\e[201~")
@@ -1205,12 +1320,249 @@ Client :< {
 		if key.code !in self.eaten do self.eaten << key.code
 	}
 
+	mouse :: fn(mut self; seq: string) !string {
+		button, x, y, up :: sgr(seq)
+		if button < 0 do return ""
+		if self.drag.kind != "" && (up || button & 32 != 0) do return self.dragged(button, x, y, up)
+		self.drag = Drag.{} # lost the release
+		press :: !up && button & 96 == 0
+		left :: press && button & 3 == 0
+		if y == self.rows - 1 {
+			if button & 98 == 64 do discard self.act(if button & 1 == 0 do "tab.previous" else do "tab.next", none)?
+			wid :: self.tab_at(x)
+			if press && button & 3 == 1 && wid != "" do self.ok("session.close_window", ["window_id" = wid])?
+			if left && wid != "" {
+				discard self.count("tab " + wid)
+				self.ok("session.focus_window", ["window_id" = wid])?
+				self.drag = Drag.{ kind = "tab", id = wid }
+			}
+			if left && self.on_pill(x) do self.drag = Drag.{ kind = "pill" }
+			if press && button & 3 == 2 && (wid != "" || self.on_pill(x)) {
+				if wid != "" {
+					self.ok("session.focus_window", ["window_id" = wid])?
+					self.view.active_window_id = wid # the view lags, the menu needs it now
+				}
+				title, items :: if wid != "" do ("Tab", tab_items()) else do ("Session", session_items())
+				self.detach = self.menu(x, y, title, items) or { self.say($.message(), true); false }
+			}
+			return ""
+		}
+		top := 0
+		loop i in 1..self.areas.len() {
+			if self.areas[i].covers(x, y) do top = i
+		}
+		area :: self.areas[top]
+		if left && top > 0 && (x < area.x || x >= area.x + area.w || y < area.y || y >= area.y + area.h) {
+			kind :: if x == area.x + area.w && y == area.y + area.h do "corner" else do "float"
+			if layer := self.win().layers.find({ ($.layer_id or "") == area.id }) {
+				self.drag = Drag.{ kind = kind, x = x, y = y, id = area.id, bounds = layer.bounds }
+			}
+			to := ""
+			loop pane in self.panes {
+				if pane.layer == top && (to == "" || pane.bid == self.bid) do to = pane.bid
+			}
+			if to != "" && to != self.bid do self.focus(to)?
+			return ""
+		}
+		if left && self.win().zoomed_block_id == none {
+			loop layer in self.win().layers {
+				if (layer.layer_id or "") != area.id do continue
+				node :: border(layer.layout or :null, x, y, area, layer.bounds) or continue
+				self.drag = Drag.{ kind = "split", node = node, area = area, bounds = layer.bounds }
+				return ""
+			}
+		}
+		loop pane in self.panes {
+			if pane.layer != top || x < pane.x || x >= pane.x + pane.w || y < pane.y || y >= pane.y + pane.h {
+				continue
+			}
+			if left && button & 16 != 0 && pane.painted {
+				start, _, _ := pane.term.viewport()
+				link :: pane.term.link(x - pane.x, start + y - pane.y)
+				if link != "" {
+					discard os.sh("xdg-open {quote(link)} >/dev/null 2>&1 &")
+					self.drag = Drag.{ kind = "eat" }
+					return ""
+				}
+			}
+			ev :: if pane.painted do report(pane.term, button, x - pane.x, y - pane.y, up) else do ""
+			if ev == "" && button & 98 == 64 && pane.painted && pane.term.scroll(if button & 1 == 0 do -3 else do 3) {
+				self.redraw()
+				return ""
+			}
+			if ev == "" && press && pane.painted do self.pressed(pane, button, x - pane.x, y - pane.y)
+			if pane.bid == self.bid {
+				if press && ev != "" do self.drag = Drag.{ kind = "program", id = pane.bid }
+				return ev
+			}
+			if button & 96 == 64 && ev != "" do self.term(pane.bid, "write", ["data" = ev])?
+			if press {
+				if self.drag.kind == "" do self.drag = Drag.{ kind = "eat" }
+				self.focus(pane.bid)?
+			}
+			return ""
+		}
+		""
+	}
+
+	pressed :: fn(mut self; pane: Pane, button, x, y: int) {
+		if button & 3 != 2 do return
+		if pane.bid != self.bid {
+			self.focus(pane.bid) or return
+			self.bid = pane.bid # the view lags, the menu needs it now
+		}
+		self.detach = self.menu(pane.x + x, pane.y + y, "Pane", pane_items()) or { self.say($.message(), true); false }
+	}
+
+	menu :: fn(mut self; x, y: int, title: string, items: []Item) !bool {
+		w :: 16
+		x0, y0 :: clamp(x, 0, self.cols - w - 2), clamp(y, 0, self.rows - items.len() - 3)
+		rows: []string = loop item in items do pad(item.label, w - 3) + item.key
+		paint :: fn(on: int) () { out("\e[?2026h" + box(x0, y0, w, title, rows, on) + "\e[?25l\e[?2026l") }
+		out(reset_modes + "\e[?1002h\e[?1006h")
+		paint(-1)
+		self.modes = ""
+		on, pick := -1, -1
+		armed := false
+		rest := self.unread
+		self.unread = ""
+		loop {
+			if rest == "" do rest = self.keys.recv() or break
+			at := on
+			if rest.starts_with("\e[<") {
+				_, _, used := keys.csi(rest)
+				if used == 0 do break
+				button, mx, my, up :: sgr(rest[..used])
+				rest = rest[used..]
+				if button & 64 != 0 do continue
+				i :: my - y0 - 1
+				at = if mx > x0 && mx <= x0 + w && i >= 0 && i < items.len() do i else do -1
+				if !up && button & 32 == 0 {
+					if at < 0 {
+						self.drag = Drag.{ kind = "eat" } # a click outside closes it
+						break
+					}
+					armed = true
+				}
+				if mx != x || my != y do armed = true
+				if up && armed {
+					pick = at
+					break
+				}
+			} else {
+				parsed, used := keys.key_of(rest)
+				rest = rest[used..]
+				key :: parsed or break
+				if key.action != "press" do continue
+				if key.names[0] == "down" {
+					at = (on + 1) % items.len()
+				} else if key.names[0] == "up" {
+					at = if on <= 0 do items.len() - 1 else do on - 1
+				} else if key.names[0] == "enter" && on >= 0 {
+					pick = on
+					break
+				} else {
+					loop i in 0..items.len() {
+						if items[i].key == key.text do pick = i
+					}
+					break
+				}
+			}
+			if at != on {
+				paint(at)
+				on = at
+			}
+		}
+		self.unread = rest
+		self.redraw()
+		if pick < 0 do return false
+		self.act(items[pick].action, Json.(items[pick].args))
+	}
+
 	choose :: fn(mut self; title: string, items: []string) int {
 		self.modes = ""
 		i, _, _, rest :: choose(title, items, self.keys, self.unread)
 		self.unread = rest
 		self.redraw()
 		i
+	}
+
+	count :: fn(mut self; here: string) int {
+		self.clicks = if here == self.click && self.click_at.elapsed() < 400.ms() do self.clicks % 3 + 1 else do 1
+		self.click = here
+		self.click_at = time.Instant.now()
+		self.clicks
+	}
+
+	on_pill :: fn(self; x: int) bool {
+		x < cells(self.view.label or "") + 2
+	}
+
+	dragged :: fn(mut self; button, x, y: int, up: bool) !string {
+		drag :: self.drag
+		if up do self.drag = Drag.{}
+		if drag.kind == "pill" && up && y == self.rows - 1 && self.on_pill(x) {
+			self.detach = self.act("session.choose", none)?
+		}
+		match drag.kind {
+			"split" => {
+				split :: drag.node.split or return ""
+				rect, area, bounds :: drag.node.rect, drag.area, drag.bounds
+				# +1, the border is the cell before the after side
+				fx :: bounds[0] + float.(x + 1 - area.x) / float.(area.w) * bounds[2]
+				fy :: bounds[1] + float.(y + 1 - area.y) / float.(area.h) * bounds[3]
+				ratio :: if split.direction == "horizontal" do (fx - rect[0]) / rect[2] else do (fy - rect[1]) / rect[3]
+				if !up do self.ratio(split, clamp(ratio, 0.05, 0.95))?
+			},
+			"float", "corner" => {
+				bounds :: drag.bounds
+				dx, dy :: float.(x - drag.x) / float.(self.cols), float.(y - drag.y) / float.(self.areas[0].h)
+				left, top, w, h :: bounds[0], bounds[1], bounds[2], bounds[3]
+				moved: json.Arr = [clamp(left + dx, 0.0, 1.0 - w), clamp(top + dy, 0.0, 1.0 - h), w, h]
+				sized: json.Arr = [left, top, clamp(w + dx, 0.05, 1.0 - left), clamp(h + dy, 0.05, 1.0 - top)]
+				to :: if drag.kind == "corner" do sized else do moved
+				if !up do self.ok("session.resize_layer", ["layer_id" = drag.id, "bounds" = to])?
+			},
+			"tab" => {
+				if up && y == self.rows - 1 {
+					to :: self.tab_at(x)
+					if to == drag.id && self.clicks == 2 do self.rename_tab(to)? else do self.drop_tab(drag.id, to)?
+				}
+			},
+			"program" => {
+				pane :: self.focused() or return ""
+				if pane.bid == drag.id && pane.painted {
+					return report(pane.term, button, clamp(x - pane.x, 0, pane.w - 1), clamp(y - pane.y, 0, pane.h - 1), up)
+				}
+			},
+			else => {},
+		}
+		""
+	}
+
+	tab_at :: fn(self; x: int) string {
+		wins :: self.view.windows or []
+		loop win, i in wins {
+			if i + 1 < self.tabs.len() && x >= self.tabs[i] && x < self.tabs[i + 1] do return win.window_id
+		}
+		""
+	}
+
+	drop_tab :: fn(mut self; wid, to: string) ! {
+		wins :: self.view.windows or []
+		i, j := -1, -1
+		loop k in 0..wins.len() {
+			if wins[k].window_id == wid do i = k
+			if wins[k].window_id == to do j = k
+		}
+		if i < 0 || j < 0 || i == j do return ()
+		args: Obj = ["window_id" = wid]
+		if j < i {
+			args["before_window_id"] = to
+		} else if j + 1 < wins.len() {
+			args["before_window_id"] = wins[j + 1].window_id
+		}
+		self.ok("session.move_window", args)?
 	}
 
 	perform :: fn(mut self; binding: keymap.Binding, key: keys.Key) !bool {
@@ -1341,6 +1693,10 @@ Client :< {
 			"pane.dim" => {
 				self.dim = !self.dim
 				self.redraw()
+			},
+			"mouse.toggle" => {
+				self.mouse_off = !self.mouse_off
+				self.say(if self.mouse_off do "mouse off" else do "mouse on")
 			},
 			"layer.raise" => self.ok("session.raise_layer", ["layer_id" = self.floating()?])?,
 			"layer.lower" => self.ok("session.lower_layer", ["layer_id" = self.floating()?])?,
@@ -1608,6 +1964,9 @@ Client :< {
 
 	write :: fn(mut self; data: string) ! {
 		if data == "" do return ()
+		loop pane in self.panes {
+			if pane.bid == self.bid && pane.painted && pane.term.scroll(0) do self.redraw()
+		}
 		self.term(self.bid, "write", ["data" = data])?
 	}
 

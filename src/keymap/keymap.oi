@@ -28,6 +28,7 @@ pub REQUEST :: r"""{
 		{"name": "client.choose", "kind": "client", "title": "Detach a Client"},
 		{"name": "client.detach_others", "kind": "client", "title": "Detach Other Clients"},
 		{"name": "client.config.reload", "kind": "client", "title": "Reload Config"},
+		{"name": "mouse.toggle", "kind": "client", "title": "Toggle Mouse"},
 		{"name": "pane.titles", "kind": "client", "title": "Toggle Pane Titles"},
 		{"name": "pane.dim", "kind": "client", "title": "Dim Unfocused Panes"},
 		{"name": "layer.new", "kind": "client", "title": "New Layer", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},

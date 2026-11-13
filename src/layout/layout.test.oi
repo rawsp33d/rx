@@ -1,5 +1,6 @@
 use json
 use json.{ Json }
+use rex
 
 test! "layouts" {
 	show :: fn(bids: []string, name: string) string {
@@ -16,6 +17,25 @@ test! "layouts" {
 				"before": {"rect": [0.2, 0, 0.7, 0.1], "block_id": "b"}, "after": {"rect": [0.2, 0.1, 0.7, 0.9], "block_id": "c"}}},
 			"after": {"rect": [0.9, 0, 0.1, 1], "block_id": "d"}}}}}""") or panic!($.message())
 	assert! (loop split in evened(tree) do "{split.direction[..1]} {split.ratio}").join(", ") == "h 0.3333333333333333, h 0.5, v 0.5"
+}
+
+test! "border" {
+	tree :: json.parse(r"""{"rect": [0.0, 0.0, 1.0, 1.0], "split": {"direction": "horizontal", "ratio": 0.5,
+		"before": {"rect": [0.0, 0.0, 0.5, 1.0], "block_id": "a"},
+		"after": {"rect": [0.5, 0.0, 0.5, 1.0], "split": {"direction": "vertical", "ratio": 0.5,
+			"before": {"rect": [0.5, 0.0, 0.5, 0.5], "block_id": "b"},
+			"after": {"rect": [0.5, 0.5, 0.5, 0.5], "block_id": "c"}}}}}""") or panic!($.message())
+	at :: fn(x, y: int, area: Area) string {
+		node :: border(tree, x, y, area, [0.0, 0.0, 1.0, 1.0]) or return ""
+		(node.split or return "").direction
+	}
+	# a | (b over c) in 20x10, then as a 10x10 float at 5, 2
+	win :: Area.{ w = 20, h = 10 }
+	assert! at(9, 3, win) == "horizontal" && at(10, 4, win) == "vertical" && at(19, 4, win) == "vertical" && at(5, 4, win) == "" && at(10, 3, win) == ""
+	float :: Area.{ x = 5, y = 2, w = 10, h = 10 }
+	assert! at(9, 6, float) == "horizontal" && at(10, 6, float) == "vertical" && at(4, 6, float) == ""
+	x, y, w, h := rex.grid([0.5, 0.0, 0.5, 0.5], [0.0, 0.0, 1.0, 1.0], 20, 10)
+	assert! x == 10 && y == 0 && w == 10 && h == 4
 }
 
 test! "stretch and shift" {

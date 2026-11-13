@@ -28,8 +28,14 @@ ghostty_render_state_row_cells_get : fn(cells: ptr, data: i32, out: ptr) i32 : f
 ghostty_render_state_row_cells_free : fn(cells: ptr) : foreign
 ghostty_cell_get : fn(cell: u64, data: i32, out: ptr) i32 : foreign
 ghostty_free : fn(alloc: ptr, p: ptr, n: usize) : foreign
+ghostty_terminal_set : fn(term: ptr, opt: i32, value: ptr) i32 : foreign
+ghostty_terminal_grid_ref : fn(term: ptr, at: Point, out: ptr) i32 : foreign
+ghostty_grid_ref_hyperlink_uri : fn(ref: ptr, buf: ptr, n: usize, out: ptr) i32 : foreign
 
 @c Viewport :: struct { tag: i32, delta: int, pad: u64 }
+
+# GhosttyPoint, tag 2 counts rows from the top of history
+@c Point :: struct { tag: i32, pad: i32, x: u16, y: u32, rest: u64 }
 
 modes :: [1 66 1000 1002 1003 1004 1006 2004]
 
@@ -236,6 +242,23 @@ Term :< {
 	pub cols :: fn(self) int {
 		discard unsafe ghostty_terminal_get(self.term, 1, self.buf) # COLS
 		int.(unsafe self.buf.read[u16]())
+	}
+
+	pub link :: fn(self; x, y: int) string {
+		buf :: self.buf
+		if !self.ref(x, y, buf.offset(8)) do return ""
+		discard unsafe ghostty_grid_ref_hyperlink_uri(buf.offset(8), ptr.(0), 0, buf) # the length it needs
+		len :: unsafe buf.read[usize]()
+		if len == 0 do return ""
+		uri :: unsafe libc.malloc(len)
+		defer unsafe libc.free(uri)
+		if unsafe ghostty_grid_ref_hyperlink_uri(buf.offset(8), uri, len, buf) != 0 do return ""
+		unsafe uri.string(int.(unsafe buf.read[usize]()))
+	}
+
+	ref :: fn(self; x, y: int, out: ptr) bool {
+		unsafe out.write(usize.(24))
+		unsafe ghostty_terminal_grid_ref(self.term, Point.{ tag = 2, x = u16.(x), y = u32.(y) }, out) == 0
 	}
 
 	pub held :: fn(self) bool { self.mode(2026) }

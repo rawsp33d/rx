@@ -34,6 +34,9 @@ test! "draw" {
 	# the first row, "!i red 界", scrolled into history
 	top, rows, total := screen.viewport()
 	assert! top == 1 && rows == 4 && total == 5 && screen.cols() == 20
+	screen.write("\e]8;;https://x.io\e\\L\e]8;;\e\\")
+	_, _, all := screen.viewport()
+	assert! screen.link(0, all - 1) == "https://x.io" && screen.link(0, 0) == ""
 	# rows past 256 cols used to get cut short
 	wide :: blank(300, 1) or panic!($.message())
 	defer wide.free()

@@ -1,7 +1,7 @@
 use json
 use json.{ Json }
 use math.{ min, max, clamp }
-use rex.{ Node, Split }
+use rex.{ Node, Split, cell }
 
 pub Area :: struct { pub x: int, pub y: int, pub w: int, pub h: int, pub id: string }
 
@@ -39,6 +39,24 @@ pub shift :: fn(bounds: []float, dir: string, by: float) json.Arr {
 	out: json.Arr = [bounds[0], bounds[1], bounds[2], bounds[3]]
 	out[i] = clamp(bounds[i] + if dir == "left" || dir == "up" do -by else do by, 0.0, 1.0 - bounds[i + 2])
 	out
+}
+
+pub border :: fn(tree: Json, x, y: int, area: Area, bounds: []float) ?Node {
+	node :: json.from_json[Node](tree) or return none
+	split :: node.split or return none
+	after :: json.from_json[Node](split.after) or return none
+	rect :: node.rect
+	# same math as rex.grid
+	cx :: fn(frac: float) int { area.x + cell((frac - bounds[0]) / bounds[2], area.w) }
+	cy :: fn(frac: float) int { area.y + cell((frac - bounds[1]) / bounds[3], area.h) }
+	on :: if split.direction == "horizontal" {
+		x == cx(after.rect[0]) - 1 && y >= cy(rect[1]) && y < cy(rect[1] + rect[3])
+	} else {
+		y == cy(after.rect[1]) - 1 && x >= cx(rect[0]) && x < cx(rect[0] + rect[2])
+	}
+	if on do return node
+	if inner := border(split.before, x, y, area, bounds) do return inner
+	border(split.after, x, y, area, bounds)
 }
 
 pub layouts :: ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]
