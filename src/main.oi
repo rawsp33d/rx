@@ -20,6 +20,8 @@ use encoding.base64
 
 Done :: struct { client_actions: ?[]keymap.Binding }
 Clients :: struct { clients: ?[]Peer }
+Blocks :: struct { blocks: []Block }
+Block :: struct { block_id: string, label: ?string }
 Peer :: struct { client_id: ?string, principal: Principal, info: ?Info, connection_state: ?string }
 Principal :: struct { display: string }
 Info :: struct { name: ?string, version: ?string, label: ?string }
@@ -28,6 +30,10 @@ Clip :: struct { text: ?string, id: ?int, bytes: ?int }
 Part :: struct { data: string, eof: bool }
 Note :: struct { title: string, body: string }
 Title :: struct { title: string }
+Status :: struct { id: string, record: Record }
+Record :: struct { id: ?string, state: string }
+Records :: struct { records: []Record }
+Removed :: struct { ids: []string }
 
 reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
 
@@ -370,6 +376,12 @@ command :: fn(fg: ?Proc) string {
 	if name.starts_with("-") do name[1..] else do name # a login shell's -zsh
 }
 
+urgency :: fn(state: string) int {
+	["", "done", "working", "error", "blocked"].index(state) or 0
+}
+
+marks :: ["", " ✓", " …", " ✗", " ?"]
+
 # so a program's text can't sneak in escapes
 printable :: fn(text: string) string {
 	out: []u8 = loop i in 0..text.len() { if text[i] < 0x20 || text[i] == 0x7f do continue; text[i] }
@@ -443,14 +455,14 @@ Pane :< {
 		ours
 	}
 
-	draw :: fn(mut self; all: bool) string {
+	draw :: fn(mut self; all, dim: bool) string {
 		if !self.painted do return ""
 		held :: !all && self.term.held()
 		if held && !self.holding do self.since = time.Instant.now()
 		self.holding = held
 		if held && self.since.elapsed() < hold.sec() do return ""
 		self.full = false
-		self.term.draw(self.x, self.y, self.w, self.h, all)
+		self.term.draw(self.x, self.y, self.w, self.h, all, dim)
 	}
 
 	close :: fn(self) {
@@ -473,7 +485,8 @@ Client :: struct {
 	streams, cols, rows, revision, peers: int
 	modes: string
 	owned: bool
-	full, readonly: bool
+	full, readonly, dim: bool
+	frames: bool # like tmux's pane-border-status bottom
 	choose: bool
 	next, dir: string
 	km: keymap.Keymap
@@ -487,7 +500,9 @@ Client :: struct {
 	msg, shown, hinted: string
 	msg_at: time.Instant
 	bad: bool
-	fg, named: [string]string
+	fg, named, labels: [string]string
+	status: [string]string # OSC 7501, by block id, newline, record id
+	seen: [string]()
 	belled: []string
 }
 
@@ -570,14 +585,27 @@ Client :< {
 	}
 
 	fetch_status :: fn(mut self) {
-		fg := self.fg # can't index assign a field's map
+		fg, status, seen := self.fg, self.status, self.seen # can't index assign a field's map
 		loop win in self.view.windows or [] {
 			bid :: win.focused_block_id or ""
 			if bid != "" && bid !in fg {
 				fg[bid] = (self.tcall[Process](bid, "process") or Process.{}) |> command($.foreground)
 			}
+			loop layer in win.layers; leaf in leaves(layer.layout or :null) {
+				if leaf.bid in seen do continue
+				seen[leaf.bid] = ()
+				records :: self.tcall[Records](leaf.bid, "program_status") or continue
+				loop record in records.records do status[leaf.bid + "\n" + (record.id or "")] = record.state
+			}
 		}
 		self.fg = fg
+		self.status = status
+		self.seen = seen
+		if !self.frames do return
+		labels: [string]string = .[]
+		blocks :: (self.call[Blocks]("session.list_blocks") or Blocks.{}).blocks
+		loop block in blocks do labels[block.block_id] = block.label or ""
+		self.labels = labels
 	}
 
 	read_clip :: fn(mut self; bid: string, id: int) string {
@@ -590,11 +618,29 @@ Client :< {
 		}
 	}
 
+	state :: fn(self; bid: string) worst: string {
+		loop state, key in self.status {
+			if key.starts_with(bid + "\n") && urgency(state) > urgency(worst) do worst = state
+		}
+		return
+	}
+
+	win_state :: fn(self; win: Window) worst: string {
+		loop layer in win.layers; leaf in leaves(layer.layout or :null) {
+			state :: self.state(leaf.bid)
+			if urgency(state) > urgency(worst) do worst = state
+		}
+		return
+	}
+
 	block_event :: fn(mut self; change: Change) {
 		bid :: change.block_id or ""
 		name :: change.name or ""
 		payload :: change.payload or :null
 		if name == "bell" do self.bell(bid)
+		if name in ["title_changed", "program_status_changed", "program_status_removed"] && self.frames {
+			self.full = true
+		}
 		if name == "clipboard_written" {
 			clip :: json.from_json[Clip](payload) or Clip.{}
 			text :: clip.text or if (clip.bytes or 0) > 0 do self.read_clip(bid, clip.id or 0) else do ""
@@ -614,6 +660,21 @@ Client :< {
 			fg := self.fg
 			fg[bid] = command((json.from_json[Process](payload) or Process.{}).foreground)
 			self.fg = fg
+		}
+		if name == "program_status_changed" {
+			update :: json.from_json[Status](payload) or return
+			status := self.status
+			status["{bid}\n{update.id}"] = update.record.state
+			self.status = status
+		}
+		if name == "program_status_removed" {
+			removed :: json.from_json[Removed](payload) or return
+			gone: []string = loop i in removed.ids do "{bid}\n{i}"
+			status: [string]string = .[]
+			loop state, key in self.status {
+				if key !in gone do status[key] = state
+			}
+			self.status = status
 		}
 		self.draw()
 	}
@@ -637,11 +698,8 @@ Client :< {
 		self.wid = win.window_id
 		self.bid = bid
 		self.belled = loop wid in self.belled { if wid == self.wid do continue; wid }
-		tiled := ""
-		loop layer in win.layers {
-			if layer.kind == "tiled" do tiled = layer.layer_id or ""
-		}
-		self.areas = [Area.{ w = self.cols, h = h, id = tiled }]
+		tiled :: (win.layers.find({ $.kind == "tiled" }) or Layer.{}).layer_id or ""
+		self.areas = [Area.{ w = self.cols, h = h - if self.frames do 1 else do 0, id = tiled }]
 		whole :: [0.0, 0.0, 1.0, 1.0]
 		kept := []Pane.{}
 		loop layer in win.layers {
@@ -778,7 +836,7 @@ Client :< {
 				redraw = all || over && layer > 0
 				if redraw do frame += self.borders(layer)
 			}
-			drawn :: self.panes[i].draw(redraw)
+			drawn :: self.panes[i].draw(redraw, self.dim && self.panes[i].bid != self.bid)
 			if drawn != "" do over = true
 			frame += drawn
 			pane :: self.panes[i]
@@ -835,7 +893,7 @@ Client :< {
 	borders :: fn(self; layer: int) string {
 		area :: self.areas[layer]
 		cols :: self.cols
-		bottom :: area.y + area.h
+		bottom :: area.y + area.h + if self.frames && layer == 0 do 1 else do 0
 		focus := Pane.{ x = -2, y = -2 }
 		edge: [int]() = .[]
 		buf := Buffer.{}
@@ -872,6 +930,13 @@ Client :< {
 			near :: x >= focus.x - 1 && x <= focus.x + focus.w && y >= focus.y - 1 && y <= focus.y + focus.h
 			buf.write("\e[{y + 1};{x + 1}H" + (if near do "\e[32m" else do "\e[39m") + lines[joins].str())
 		}
+		loop pane in self.panes {
+			if !self.frames do break
+			title :: self.pane_title(pane) + marks[urgency(self.state(pane.bid))]
+			if pane.layer != layer || title == "" || pane.w < 5 do continue
+			color :: if pane.bid == self.bid do "\e[1;32m" else do "\e[0;39m"
+			buf.write("\e[{pane.y + pane.h + 1};{pane.x + 2}H" + color + " " + fit(printable(title), pane.w - 4) + " \e[0m")
+		}
 		buf.str()
 	}
 
@@ -894,7 +959,8 @@ Client :< {
 		loop i in 0..wins.len() {
 			win :: wins[i]
 			name :: self.tab_name(win)
-			flags :: (if win.zoomed_block_id != none do " Z" else do "") + (if minimized(win) do " M" else do "") + if win.window_id in self.belled do " !" else do ""
+			flags :: (if win.zoomed_block_id != none do " Z" else do "") + (if minimized(win) do " M" else do "") +
+				(if win.window_id in self.belled do " !" else do "") + marks[urgency(self.win_state(win))]
 			current :: win.window_id == active
 			line += (if current do "\e[0;30;42m " else do "\e[0m ") + "{i + 1}" + (if name != "" do " " + name else do "") + (if current do "" else do "\e[33m") + flags + " "
 			plain += " {i + 1}" + (if name != "" do " " + name else do "") + flags + " "
@@ -916,6 +982,13 @@ Client :< {
 		if col + width - 1 > end do line += "\e[{self.rows};{end}H…"
 		if end < self.cols do line += "\e[{self.rows};{end + 1}H\e[0m \e[30;44m" + clock
 		line + "\e[0m\e[?7h"
+	}
+
+	pane_title :: fn(self; pane: Pane) string {
+		label :: self.labels[pane.bid] or ""
+		if label != "" do return label
+		title :: if pane.painted do pane.term.title() else do ""
+		if title != "" do title else do self.fg[pane.bid] or ""
 	}
 
 	tab_name :: fn(self; win: Window) string {
@@ -1225,6 +1298,15 @@ Client :< {
 			},
 			"client.detach_others" => loop peer in self.others()? do self.kick(peer)?,
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
+			"pane.titles" => {
+				self.frames = !self.frames
+				self.fetch_status()
+				self.relayout()?
+			},
+			"pane.dim" => {
+				self.dim = !self.dim
+				self.redraw()
+			},
 			"layer.raise" => self.ok("session.raise_layer", ["layer_id" = self.floating()?])?,
 			"layer.lower" => self.ok("session.lower_layer", ["layer_id" = self.floating()?])?,
 			"layer.close" => self.ok("session.close_layer", ["layer_id" = self.floating()?])?,
@@ -1250,6 +1332,19 @@ Client :< {
 			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
 			"pane.last" => self.focus(self.last_bid[self.wid] or return error("no last pane"))?,
 			"pane.next" => self.ok("session.focus_next_pane", ["wrap" = true])?,
+			"pane.attention" => {
+				bids :: loop win in self.view.windows or []; layer in win.layers; leaf in leaves(layer.layout or :null) {
+					leaf.bid
+				}
+				i :: bids.index(self.bid) or -1
+				loop k in 1..=bids.len() {
+					bid :: bids[(i + k) % bids.len()]
+					if urgency(self.state(bid)) < 3 do continue
+					self.focus(bid)?
+					return false
+				}
+				return error("no program waiting")
+			},
 			"tab.new" => self.new_tab(opts.side or "", opts.command or "")?,
 			"client.tab.goto" => {
 				wins :: self.view.windows or []

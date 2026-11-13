@@ -110,7 +110,7 @@ Term :< {
 		unsafe self.buf.read[u8]() == 0
 	}
 
-	pub draw :: fn(self; x, y, w, h: int, all: bool) string {
+	pub draw :: fn(self; x, y, w, h: int, all: bool, dim := false) string {
 		buf :: self.buf
 		discard unsafe ghostty_render_state_update(self.state, self.term)
 		if all {
@@ -141,7 +141,8 @@ Term :< {
 				wide :: unsafe buf.read[i32]()
 				if wide == 2 do continue # spacer tail
 				if wide == 1 && col + 1 >= w do break
-				style :: self.sgr(raw)
+				style := self.sgr(raw)
+				if dim do style = style[..(style.len() - 1)] + ";2m"
 				if style != sgr {
 					out.write(style)
 					sgr = style
