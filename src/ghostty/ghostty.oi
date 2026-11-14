@@ -30,12 +30,23 @@ ghostty_cell_get : fn(cell: u64, data: i32, out: ptr) i32 : foreign
 ghostty_free : fn(alloc: ptr, p: ptr, n: usize) : foreign
 ghostty_terminal_set : fn(term: ptr, opt: i32, value: ptr) i32 : foreign
 ghostty_terminal_grid_ref : fn(term: ptr, at: Point, out: ptr) i32 : foreign
+ghostty_grid_ref_cell : fn(ref: ptr, out: ptr) i32 : foreign
+ghostty_grid_ref_graphemes : fn(ref: ptr, buf: ptr, n: usize, out: ptr) i32 : foreign
 ghostty_grid_ref_hyperlink_uri : fn(ref: ptr, buf: ptr, n: usize, out: ptr) i32 : foreign
+ghostty_terminal_selection_format_alloc : fn(term: ptr, alloc: ptr, opts: Format, out: ptr, n: ptr) i32 : foreign
+ghostty_terminal_point_from_grid_ref : fn(term: ptr, ref: ptr, tag: i32, out: ptr) i32 : foreign
+ghostty_search_new : fn(alloc: ptr, out: ptr, term: ptr) i32 : foreign
+ghostty_search_free : fn(search: ptr) : foreign
+ghostty_search_run : fn(search: ptr) i32 : foreign
+ghostty_search_set : fn(search: ptr, opt: i32, value: ptr) i32 : foreign
+ghostty_search_get : fn(search: ptr, data: i32, out: ptr) i32 : foreign
 
 @c Viewport :: struct { tag: i32, delta: int, pad: u64 }
 
 # GhosttyPoint, tag 2 counts rows from the top of history
 @c Point :: struct { tag: i32, pad: i32, x: u16, y: u32, rest: u64 }
+
+@c Format :: struct { size: usize, emit: i32, unwrap: u8, trim: u8, selection: ptr }
 
 modes :: [1 66 1000 1002 1003 1004 1006 2004]
 
@@ -116,7 +127,10 @@ Term :< {
 		unsafe self.buf.read[u8]() == 0
 	}
 
-	pub draw :: fn(self; x, y, w, h: int, all: bool, dim := false) string {
+	# TODO: highlight where a match wraps onto the next row
+	pub draw :: fn(self; x, y, w, h: int, all: bool, dim := false, marks: []int = [], width := 0) string {
+		top, _, _ :: self.viewport()
+		cols :: self.cols()
 		buf :: self.buf
 		discard unsafe ghostty_render_state_update(self.state, self.term)
 		if all {
@@ -137,6 +151,13 @@ Term :< {
 			out.write("\e[{y + row + 1};{x + 1}H")
 			unsafe buf.write(self.cells)
 			discard unsafe ghostty_render_state_row_get(self.rows, 3, buf) # CELLS
+			sel :: buf.offset(8)
+			unsafe sel.write(usize.(16))
+			lo, hi := 1, 0
+			if unsafe ghostty_render_state_row_get(self.rows, 4, sel) == 0 { # SELECTION
+				lo, hi = int.(unsafe sel.offset(8).read[u16]()), int.(unsafe sel.offset(10).read[u16]())
+			}
+			at: []int = loop mark in marks { if mark / cols != top + row do continue; mark % cols }
 			sgr, col := "", 0
 			loop col < w {
 				more :: unsafe ghostty_render_state_row_cells_next(self.cells)
@@ -148,6 +169,13 @@ Term :< {
 				if wide == 2 do continue # spacer tail
 				if wide == 1 && col + 1 >= w do break
 				style := self.sgr(raw)
+				if col >= lo && col <= hi {
+					style = style[..(style.len() - 1)] + ";7m"
+				} else {
+					loop start in at {
+						if col >= start && col < start + width do style = style[..(style.len() - 1)] + ";30;43m"
+					}
+				}
 				if dim do style = style[..(style.len() - 1)] + ";2m"
 				if style != sgr {
 					out.write(style)
@@ -244,6 +272,16 @@ Term :< {
 		int.(unsafe self.buf.read[u16]())
 	}
 
+	# y counts from the top of history, here and below
+	pub rune_at :: fn(self; x, y: int) int {
+		buf :: self.buf
+		if !self.ref(x, y, buf.offset(8)) do return 0
+		if unsafe ghostty_grid_ref_graphemes(buf.offset(8), buf.offset(128), 32, buf) != 0 || unsafe buf.read[usize]() == 0 {
+			return 0
+		}
+		int.(unsafe buf.offset(128).read[u32]())
+	}
+
 	pub link :: fn(self; x, y: int) string {
 		buf :: self.buf
 		if !self.ref(x, y, buf.offset(8)) do return ""
@@ -254,6 +292,85 @@ Term :< {
 		defer unsafe libc.free(uri)
 		if unsafe ghostty_grid_ref_hyperlink_uri(buf.offset(8), uri, len, buf) != 0 do return ""
 		unsafe uri.string(int.(unsafe buf.read[usize]()))
+	}
+
+	pub tail :: fn(self; x, y: int) bool {
+		buf :: self.buf
+		if !self.ref(x, y, buf.offset(8)) || unsafe ghostty_grid_ref_cell(buf.offset(8), buf) != 0 {
+			return false
+		}
+		cell :: unsafe buf.read[u64]()
+		discard unsafe ghostty_cell_get(cell, 3, buf) # WIDE
+		unsafe buf.read[i32]() == 2
+	}
+
+	pub prompt :: fn(self; delta: int) bool {
+		top, _, _ := self.viewport()
+		unsafe ghostty_terminal_scroll_viewport(self.term, Viewport.{ tag = 4, delta = delta }) # DELTA_PROMPT
+		self.viewport().0 != top
+	}
+
+	pub select :: fn(self; ax, ay, bx, by: int, rect := false) {
+		if ay < 0 {
+			discard unsafe ghostty_terminal_set(self.term, 21, ptr.(0)) # SELECTION
+			return
+		}
+		sel :: self.selection(ax, ay, bx, by, rect)
+		defer unsafe libc.free(sel)
+		discard unsafe ghostty_terminal_set(self.term, 21, sel)
+	}
+
+	pub copy :: fn(self; ax, ay, bx, by: int, rect := false) string {
+		sel :: self.selection(ax, ay, bx, by, rect)
+		defer unsafe libc.free(sel)
+		buf :: self.buf
+		format :: Format.{ size = 24, unwrap = 1, trim = 1, selection = sel }
+		if unsafe ghostty_terminal_selection_format_alloc(self.term, ptr.(0), format, buf, buf.offset(8)) != 0 {
+			return ""
+		}
+		start, len :: unsafe buf.read[ptr](), unsafe buf.offset(8).read[usize]()
+		text :: unsafe start.string(int.(len))
+		unsafe ghostty_free(ptr.(0), start, len)
+		text
+	}
+
+	# y * cols + x, oldest first
+	pub find :: fn(self; needle: string) []int {
+		buf :: self.buf
+		if needle == "" || unsafe ghostty_search_new(ptr.(0), buf, self.term) != 0 do return []
+		search :: unsafe buf.read[ptr]()
+		defer unsafe ghostty_search_free(search)
+		unsafe buf.write(needle.ptr)
+		unsafe buf.offset(8).write(usize.(needle.len()))
+		discard unsafe ghostty_search_set(search, 0, buf) # NEEDLE
+		discard unsafe ghostty_search_run(search)
+		discard unsafe ghostty_search_get(search, 2, buf) # TOTAL_MATCHES
+		count :: int.(unsafe buf.read[usize]())
+		if count == 0 do return []
+		matches :: unsafe libc.calloc(usize.(count), 64)
+		defer unsafe libc.free(matches)
+		loop i in 0..count do unsafe matches.offset(i * 64).write(usize.(64))
+		unsafe buf.write(matches)
+		unsafe buf.offset(8).write(usize.(count))
+		if unsafe ghostty_search_get(search, 5, buf) != 0 do return [] # MATCHES
+		got :: int.(unsafe buf.offset(16).read[usize]())
+		cols :: self.cols()
+		out := []int.{}
+		# newest first, so walk them backward
+		loop i in 0..got {
+			start :: matches.offset((got - 1 - i) * 64 + 8)
+			if unsafe ghostty_terminal_point_from_grid_ref(self.term, start, 2, buf) != 0 do continue
+			out << int.(unsafe buf.offset(4).read[u32]()) * cols + int.(unsafe buf.read[u16]())
+		}
+		out
+	}
+
+	selection :: fn(self; ax, ay, bx, by: int, rect: bool) ptr {
+		sel :: unsafe libc.calloc(1, 64)
+		unsafe sel.write(usize.(64))
+		discard self.ref(ax, ay, sel.offset(8)) && self.ref(bx, by, sel.offset(32))
+		if rect do unsafe sel.offset(56).write(u8.(1))
+		sel
 	}
 
 	ref :: fn(self; x, y: int, out: ptr) bool {

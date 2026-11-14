@@ -33,10 +33,18 @@ test! "draw" {
 	assert! !screen.scrolled() && screen.scroll(-2) && screen.scrolled() && screen.scroll(0) && !screen.scrolled() && !screen.scroll(5)
 	# the first row, "!i red 界", scrolled into history
 	top, rows, total := screen.viewport()
-	assert! top == 1 && rows == 4 && total == 5 && screen.cols() == 20
+	assert! top == 1 && rows == 4 && total == 5 && screen.cols() == 20 && screen.rune_at(3, 0) == 'r' && screen.rune_at(19, 0) == 0
+	assert! screen.copy(3, 0, 19, 1) == "red 界" && screen.copy(0, 9, 1, 9) == ""
+	assert! screen.find("RE").len() == 1 && screen.find("RE")[0] == 3 && screen.find("zz").len() == 0
+	assert! screen.scroll(-1)
+	screen.select(1, 0, 4, 0)
+	assert! screen.draw(0, 0, 20, 4, true).starts_with("\e[1;1H\e[0m!\e[0;7mi \e[0;1;31;7mre\e[0;1;31md")
+	screen.select(-1, -1, 0, 0)
+	assert! screen.draw(0, 0, 20, 4, true).starts_with("\e[1;1H\e[0m!i \e[0;1;31mred")
 	screen.write("\e]8;;https://x.io\e\\L\e]8;;\e\\")
 	_, _, all := screen.viewport()
 	assert! screen.link(0, all - 1) == "https://x.io" && screen.link(0, 0) == ""
+	assert! screen.draw(0, 0, 20, 4, true, false, screen.find("re"), 2).starts_with("\e[1;1H\e[0m!i \e[0;1;31;30;43mre\e[0;1;31md")
 	# rows past 256 cols used to get cut short
 	wide :: blank(300, 1) or panic!($.message())
 	defer wide.free()

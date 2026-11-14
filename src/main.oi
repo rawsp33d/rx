@@ -16,6 +16,7 @@ use keymap
 use ghostty
 use prompt.{ chop, fuzzy }
 use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift, border }
+use copy.{ Copy, Hit, hits, word }
 use encoding.base64
 
 Done :: struct { client_actions: ?[]keymap.Binding }
@@ -28,6 +29,7 @@ Info :: struct { name: ?string, version: ?string, label: ?string }
 
 Clip :: struct { text: ?string, id: ?int, bytes: ?int }
 Part :: struct { data: string, eof: bool }
+Text :: struct { content: string }
 Note :: struct { title: string, body: string }
 Title :: struct { title: string }
 Status :: struct { id: string, record: Record }
@@ -410,12 +412,16 @@ around :: fn(tree: Json, bid, direction: string) ?Node {
 	none
 }
 Drag :: struct {
-	kind: string # split, float, corner, tab, pill, program, eat or ""
+	kind: string # split, float, corner, tab, pill, select, program, eat or ""
 	x, y: int
 	node: Node
 	area: Area
 	id: string
 	bounds: []float
+	moved: bool
+	px, py: int
+	edge: bool
+	block: bool
 }
 
 Drag :< {
@@ -470,6 +476,8 @@ pane_items :: fn() []Item {
 		Item.{ label = "Split Down", key = "j", action = "pane.split", args = ["direction" = "down"] },
 		Item.{ label = "Zoom", key = "z", action = "pane.zoom" },
 		Item.{ label = "Float", key = "f", action = "layer.float" },
+		Item.{ label = "Copy Mode", key = "c", action = "pane.copy" },
+		Item.{ label = "Paste", key = "p", action = "pane.paste" },
 		Item.{ label = "Close", key = "X", action = "pane.close" },
 	]
 }
@@ -549,14 +557,14 @@ Pane :< {
 		ours
 	}
 
-	draw :: fn(mut self; all, dim: bool) string {
+	draw :: fn(mut self; all, dim: bool, cp: Copy) string {
 		if !self.painted do return ""
 		held :: !all && self.term.held()
 		if held && !self.holding do self.since = time.Instant.now()
 		self.holding = held
 		if held && self.since.elapsed() < hold.sec() do return ""
 		self.full = false
-		self.term.draw(self.x, self.y, self.w, self.h, all, dim)
+		self.term.draw(self.x, self.y, self.w, self.h, all, dim, cp.marks, cells(cp.needle))
 	}
 
 	close :: fn(self) {
@@ -599,9 +607,12 @@ Client :: struct {
 	seen: [string]()
 	layout: int
 	tiling, tiled_as: [string]string # auto tiling like dvtm, by window
+	cp, land: Copy
+	parked: []Copy
+	buffers: []string
 	drag: Drag
 	clicks: int
-	click: string
+	click, flash: string
 	click_at: time.Instant
 	tabs: []int
 	belled: []string
@@ -687,6 +698,7 @@ Client :< {
 		self.fetch_status()
 		self.relayout()?
 		self.retile()?
+		if self.land.bid != self.bid do self.land = Copy.{}
 	}
 
 	retile :: fn(mut self) ! {
@@ -774,7 +786,7 @@ Client :< {
 		if name == "clipboard_written" {
 			clip :: json.from_json[Clip](payload) or Clip.{}
 			text :: clip.text or if (clip.bytes or 0) > 0 do self.read_clip(bid, clip.id or 0) else do ""
-			if text != "" do out("\e]52;c;{base64.encode(text)}\a")
+			if text != "" do self.clip(text)
 		}
 		if name == "desktop_notification" {
 			note :: json.from_json[Note](payload) or return
@@ -849,6 +861,8 @@ Client :< {
 		}
 		loop pane in self.panes do pane.close()
 		self.panes = kept
+		self.refocus()
+		self.landed()
 		# only the active client claims, or two would trade blocks forever
 		if self.owned do self.own()
 		self.redraw()
@@ -938,6 +952,7 @@ Client :< {
 			}
 			self.panes[i].read += data.len()
 			if !self.panes[i].feed(data, self.cid) do self.owned = false
+			self.landed()
 			return
 		}
 	}
@@ -966,18 +981,23 @@ Client :< {
 				redraw = all || over && layer > 0
 				if redraw do frame += self.borders(layer)
 			}
-			drawn :: self.panes[i].draw(redraw, self.dim && self.panes[i].bid != self.bid)
+			bid :: self.panes[i].bid
+			drawn :: self.panes[i].draw(redraw, self.dim && bid != self.bid, self.copy_of(bid))
 			if drawn != "" do over = true
 			frame += drawn
 			pane :: self.panes[i]
 			if pane.bid != self.bid || !pane.painted do continue
 			# always bracket pastes so input can tell them from typing
-			modes :: pane.term.modes() + "\e[?2004h" + if self.mouse_off do "" else do mouse_on(pane.term)
+			keyboard :: if self.cp.bid == pane.bid do reset_modes else do pane.term.modes() + "\e[?2004h"
+			modes :: keyboard + if self.mouse_off do "" else do mouse_on(pane.term)
 			if modes != self.modes {
 				frame += modes
 				self.modes = modes
 			}
 			seq, cx, cy := pane.term.cursor(pane.x, pane.y, pane.w, pane.h)
+			if self.cp.bid == pane.bid {
+				seq, cx, cy = self.cp.cursor(pane.term, pane.x, pane.y, pane.w, pane.h)
+			}
 			cursor = seq
 			if self.areas[(pane.layer + 1)..].any({ $.covers(cx, cy) }) do cursor = "\e[?25l"
 		}
@@ -992,15 +1012,23 @@ Client :< {
 	}
 
 	wake :: fn(self) time.Duration {
-		if self.msg != "" do return 250.ms()
-		loop pane in self.panes {
-			if pane.holding do return 250.ms()
-		}
+		if self.drag.edge do return 50.ms()
+		if self.msg != "" || self.flash != "" do return 250.ms()
+		if self.panes.any({ $.holding }) do return 250.ms()
 		2.sec()
 	}
 
 	tick :: fn(mut self) {
 		if self.msg != "" && self.msg_at.elapsed() > 3.sec() do self.msg = ""
+		if self.flash != "" && self.click_at.elapsed() > 300.ms() {
+			loop pane in self.panes {
+				if pane.bid != self.flash || !pane.painted || self.copying(pane.bid) do continue
+				pane.term.select(-1, -1, 0, 0)
+			}
+			self.flash = ""
+			self.full = true
+		}
+		if self.drag.edge do self.select(self.drag, self.drag.px, self.drag.py, false)
 		self.draw()
 	}
 
@@ -1076,6 +1104,7 @@ Client :< {
 		line := "\e[{self.rows};1H\e[?7l\e[0m\e[2K" + pill + label
 		plain := label
 		modes: []string = loop mode in self.modes_on do mode
+		if self.cp.bid != "" do modes << "copy"
 		if self.readonly do modes << "ro"
 		if self.peers > 0 do modes << "+{self.peers} attached"
 		loop mode in modes {
@@ -1287,7 +1316,9 @@ Client :< {
 			typed << key.names
 			hit, drop := keymap.resolve(self.km, typed, self.can, self.modes_on.last() or "")
 			hit :: hit or {
-				if self.typed.len() == 0 && !drop do pass += buf[..used] else do self.eat(key)
+				copying :: self.cp.bid != ""
+				if self.typed.len() == 0 && copying do self.copy_key(key)
+				if self.typed.len() == 0 && !drop && !copying do pass += buf[..used] else do self.eat(key)
 				self.typed = []
 				continue
 			}
@@ -1304,6 +1335,81 @@ Client :< {
 		self.write(pass)?
 		if self.bar() != self.shown || self.which() != self.hinted do self.draw()
 		false
+	}
+
+	copy_key :: fn(mut self; key: keys.Key) {
+		pane :: self.focused() or return
+		name := if key.text != "" do key.text else do key.names[0]
+		if name == "/" || name == "?" {
+			needle :: self.ask(name)
+			if needle == "" do return
+			self.cp.needle = needle
+			self.cp.back = name == "?"
+			name = "n"
+		}
+		yank, done := self.cp.key(pane.term, name)
+		if yank != "" do self.clip(yank, name == "O")
+		if done do self.stop_copy()
+		self.redraw()
+	}
+
+	clip :: fn(mut self; text: string, open := false) {
+		kept := [text]
+		loop old in self.buffers {
+			if old != text && kept.len() < 20 do kept << old
+		}
+		self.buffers = kept
+		if open do discard os.sh("printf %s {quote(text)} | xargs xdg-open >/dev/null 2>&1 &")
+		else do out("\e]52;c;{base64.encode(text)}\a")
+	}
+
+	stop_copy :: fn(mut self) {
+		loop pane in self.panes {
+			if pane.bid != self.cp.bid || !pane.painted do continue
+			pane.term.select(-1, -1, 0, 0)
+			discard pane.term.scroll(0)
+		}
+		self.cp = Copy.{}
+		self.full = true
+	}
+
+	refocus :: fn(mut self) {
+		parked := self.parked
+		if self.cp.bid != "" do parked << self.cp
+		self.cp = Copy.{}
+		shown: []string = loop pane in self.panes do pane.bid
+		self.parked = loop mode in parked {
+			if mode.bid !in shown do continue
+			if mode.bid == self.bid {
+				self.cp = mode
+				continue
+			}
+			mode
+		}
+	}
+
+	landed :: fn(mut self) {
+		if self.land.bid == "" || self.land.bid != self.bid do return
+		pane :: self.focused() or return
+		if !pane.painted do return
+		_, _, total := pane.term.viewport()
+		mode := Copy.{ bid = pane.bid, x = pane.term.cols() - 1, y = total - 1, needle = self.land.needle, back = true }
+		discard mode.key(pane.term, "n")
+		mode.needle = self.land.sel
+		mode.marks = pane.term.find(mode.needle)
+		mode.back = false
+		self.cp = mode
+		self.land = Copy.{}
+		self.redraw()
+	}
+
+	copying :: fn(self; bid: string) bool {
+		self.copy_of(bid).bid != ""
+	}
+
+	copy_of :: fn(self; bid: string) Copy {
+		if self.cp.bid == bid do return self.cp
+		self.parked.find({ $.bid == bid }) or Copy.{}
 	}
 
 	focused :: fn(self) ?Pane {
@@ -1385,7 +1491,11 @@ Client :< {
 					return ""
 				}
 			}
-			ev :: if pane.painted do report(pane.term, button, x - pane.x, y - pane.y, up) else do ""
+			ev :: if pane.painted && !self.copying(pane.bid) {
+				report(pane.term, button, x - pane.x, y - pane.y, up)
+			} else {
+				""
+			}
 			if ev == "" && button & 98 == 64 && pane.painted && pane.term.scroll(if button & 1 == 0 do -3 else do 3) {
 				self.redraw()
 				return ""
@@ -1406,12 +1516,29 @@ Client :< {
 	}
 
 	pressed :: fn(mut self; pane: Pane, button, x, y: int) {
-		if button & 3 != 2 do return
-		if pane.bid != self.bid {
-			self.focus(pane.bid) or return
-			self.bid = pane.bid # the view lags, the menu needs it now
+		if button & 3 == 1 do self.paste(pane) or { self.say($.message(), true) }
+		if button & 3 == 2 {
+			if pane.bid != self.bid {
+				self.focus(pane.bid) or return
+				self.bid = pane.bid # the view lags, the menu needs it now
+			}
+			self.detach = self.menu(pane.x + x, pane.y + y, "Pane", pane_items()) or { self.say($.message(), true); false }
 		}
-		self.detach = self.menu(pane.x + x, pane.y + y, "Pane", pane_items()) or { self.say($.message(), true); false }
+		if button & 3 != 0 do return
+		discard self.count("{pane.bid} {x} {y}")
+		top, _, _ := pane.term.viewport()
+		row :: top + y
+		if self.clicks == 1 {
+			self.drag = Drag.{ kind = "select", x = x, y = row, id = pane.bid, block = button & 8 != 0 }
+			return
+		}
+		ax, bx := 0, pane.term.cols() - 1
+		if self.clicks == 2 do ax, bx = word(pane.term, x, row)
+		pane.term.select(ax, row, bx, row)
+		self.flash = pane.bid
+		self.full = true
+		self.clip(pane.term.copy(ax, row, bx, row))
+		self.say("copied")
 	}
 
 	menu :: fn(mut self; x, y: int, title: string, items: []Item) !bool {
@@ -1479,6 +1606,63 @@ Client :< {
 		self.act(items[pick].action, Json.(items[pick].args))
 	}
 
+	next_key :: fn(mut self) ?keys.Key {
+		if self.unread == "" do self.unread = self.keys.recv() or return none
+		key, used := keys.key_of(self.unread)
+		self.unread = self.unread[used..]
+		key
+	}
+
+	quick :: fn(mut self) ! {
+		pane :: self.painted()?
+		top, _, _ := pane.term.viewport()
+		found := []Hit.{}
+		loop y in 0..pane.h; hit in hits(pane.term, top + y) {
+			if hit.x < pane.w do found << hit
+		}
+		alphabet :: "asdfjklghqweruiopzxcvbnmty"
+		base :: alphabet.len()
+		texts := []string.{}
+		loop i in 0..found.len() {
+			hit :: found[found.len() - 1 - i]
+			if hit.text !in texts && texts.len() < base * base do texts << hit.text
+		}
+		if texts.len() == 0 do return error("nothing to copy")
+		two :: texts.len() > base
+		label :: fn(i: int) string {
+			if two {
+				alphabet[(i / base)..(i / base + 1)] + alphabet[(i % base)..(i % base + 1)]
+			} else {
+				alphabet[i..(i + 1)]
+			}
+		}
+		frame := reset_modes + "\e[?2026h"
+		self.modes = ""
+		loop hit in found {
+			i :: texts.index(hit.text) or continue
+			frame += "\e[{pane.y + hit.y - top + 1};{pane.x + hit.x + 1}H\e[30;43m" + label(i) + "\e[0m"
+		}
+		out(frame + "\e[?25l\e[?2026l")
+		typed, pick, shifted := "", -1, false
+		loop {
+			key :: self.next_key() or break
+			if key.action != "press" do continue
+			char :: key.text.lower()
+			if char.len() != 1 || !alphabet.contains(char) do break
+			shifted = shifted || char != key.text
+			typed += char
+			if typed.len() < label(0).len() do continue
+			loop i in 0..texts.len() {
+				if label(i) == typed do pick = i
+			}
+			break
+		}
+		self.redraw()
+		if pick < 0 do return ()
+		self.clip(texts[pick])
+		if shifted do self.paste(pane)? else do self.say("copied")
+	}
+
 	choose :: fn(mut self; title: string, items: []string) int {
 		self.modes = ""
 		i, _, _, rest :: choose(title, items, self.keys, self.unread)
@@ -1496,6 +1680,14 @@ Client :< {
 
 	on_pill :: fn(self; x: int) bool {
 		x < cells(self.view.label or "") + 2
+	}
+
+	paste :: fn(mut self; pane: Pane, i := 0) ! {
+		if i >= self.buffers.len() do return error("nothing copied")
+		text :: self.buffers[i]
+		data :: if pane.painted && pane.term.mode(2004) do "\e[200~{text}\e[201~" else do text
+		if pane.bid != self.bid do return self.term(pane.bid, "write", ["data" = data])
+		self.write(data)
 	}
 
 	dragged :: fn(mut self; button, x, y: int, up: bool) !string {
@@ -1529,6 +1721,7 @@ Client :< {
 					if to == drag.id && self.clicks == 2 do self.rename_tab(to)? else do self.drop_tab(drag.id, to)?
 				}
 			},
+			"select" => self.select(drag, x, y, up),
 			"program" => {
 				pane :: self.focused() or return ""
 				if pane.bid == drag.id && pane.painted {
@@ -1538,6 +1731,37 @@ Client :< {
 			else => {},
 		}
 		""
+	}
+
+	select :: fn(mut self; drag: Drag, x, y: int, up: bool) {
+		self.drag.edge = false
+		pane :: self.panes.find({ $.bid == drag.id }) or return
+		if !pane.painted do return
+		if up {
+			if drag.moved && self.cp.bid == pane.bid {
+				self.clip(self.cp.copy(pane.term))
+				self.stop_copy()
+				self.say("copied")
+			}
+			return
+		}
+		if !drag.moved {
+			self.drag.moved = true
+			self.parked = loop mode in self.parked { if mode.bid == pane.bid do continue; mode }
+			if self.cp.bid != "" && self.cp.bid != pane.bid do self.parked << self.cp
+			self.cp = Copy.{ bid = pane.bid, x = drag.x, y = drag.y, ax = drag.x, ay = drag.y, sel = if drag.block do "ctrl+v" else do "v" }
+		}
+		top, _, total := pane.term.viewport()
+		row := y - pane.y
+		if row <= 0 do row -= 1
+		if row >= pane.h - 1 do row += 1
+		self.drag.px = x
+		self.drag.py = y
+		self.drag.edge = row < 0 && top > 0 || row >= pane.h && top + pane.h < total
+		self.cp.go(pane.term, x - pane.x, top + row)
+		ax, ay, bx, by := self.cp.ends(pane.term)
+		pane.term.select(ax, ay, bx, by, self.cp.sel == "ctrl+v")
+		self.redraw()
 	}
 
 	tab_at :: fn(self; x: int) string {
@@ -1677,6 +1901,19 @@ Client :< {
 				self.ok("session.swap_blocks", ["block_id" = self.bid, "other_block_id" = other.bid])?
 			},
 			"layer.float" => self.float()?,
+			"pane.copy" => {
+				pane :: self.painted()?
+				top, rows, _ := pane.term.viewport()
+				_, cx, cy := pane.term.cursor(0, 0, pane.w, pane.h)
+				self.cp = Copy.{ bid = pane.bid, x = max(cx, 0), y = top + if cy < 0 do rows - 1 else do cy }
+				self.redraw()
+			},
+			"pane.paste" => self.paste(self.focused() or return error("no pane"))?,
+			"buffer.choose" => {
+				if self.buffers.len() == 0 do return error("nothing copied")
+				i :: self.choose(title, loop buf in self.buffers do buf.replace("\n", "↵").replace("\t", " "))
+				if i >= 0 do self.paste(self.focused() or return error("no pane"), i)?
+			},
 			"client.choose" => {
 				peers :: self.others()?
 				if peers.len() == 0 do return error("no other client")
@@ -1685,6 +1922,29 @@ Client :< {
 			},
 			"client.detach_others" => loop peer in self.others()? do self.kick(peer)?,
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
+			"pane.hints" => self.quick()?,
+			"pane.find" => {
+				query :: self.ask("find: ").lower()
+				if query == "" do return false
+				items, bids, lines := []string.{}, []string.{}, []string.{}
+				wins :: self.view.windows or []
+				loop win, i in wins; layer in win.layers; leaf in leaves(layer.layout or :null) {
+					# TODO: a block too big for one reply is skipped, page with blob_read
+					text :: self.tcall[Text](leaf.bid, "format", ["trim" = true, "unwrap" = true]) or continue
+					loop line in text.content.split("\n") {
+						if !line.lower().contains(query) do continue
+						items << "{i + 1} {self.tab_name(wins[i])}: " + printable(line.trim())
+						bids << leaf.bid
+						lines << line.trim()
+					}
+				}
+				if items.len() == 0 do return error("no match")
+				i :: self.choose(title, items)
+				if i < 0 do return false
+				self.land = Copy.{ bid = bids[i], needle = lines[i], sel = query }
+				self.focus(bids[i])?
+				self.landed()
+			},
 			"pane.titles" => {
 				self.frames = !self.frames
 				self.fetch_status()

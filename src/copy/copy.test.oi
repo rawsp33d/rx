@@ -1,0 +1,46 @@
+use ghostty
+
+test! "copy mode" {
+	term :: ghostty.blank(20, 3) or panic!($.message())
+	defer term.free()
+	term.write("foo.bar  baz\r\nqux\r\n\r\nlast")
+	mode := Copy.{ bid = "b" }
+	at :: fn(mode: Copy) string { "{mode.x},{mode.y}" }
+	loop key in ["w", "w", "w", "e"] do discard mode.key(term, key)
+	assert! at(mode) == "11,0"
+	discard mode.key(term, "w")
+	discard mode.key(term, "b")
+	assert! at(mode) == "9,0"
+	discard mode.key(term, "v")
+	discard mode.key(term, "j")
+	yank, done := mode.key(term, "y")
+	assert! yank == "baz\nqux" && done
+	mode = Copy.{ bid = "b" }
+	loop key in ["G", "$", "V", "k", "k"] do discard mode.key(term, key)
+	assert! at(mode) == "3,1" && mode.copy(term) == "qux\n\nlast"
+	# a's at 5 and 10 on the first row, and 1 on the last
+	mode.needle = "A"
+	discard mode.key(term, "n")
+	assert! at(mode) == "1,3"
+	discard mode.key(term, "n")
+	assert! at(mode) == "5,0"
+	discard mode.key(term, "N")
+	assert! at(mode) == "1,3"
+	mode = Copy.{ bid = "b", x = 1 }
+	loop key in ["ctrl+v", "j", "l"] do discard mode.key(term, key)
+	assert! mode.key(term, "y").0 == "oo\nux"
+	prompts :: ghostty.blank(20, 3) or panic!($.message())
+	defer prompts.free()
+	loop i in 0..3 do prompts.write("\e]133;A\a$ cmd{i}\r\n\e]133;C\aout\r\nout\r\n")
+	prompts.write("\e]133;A\a$ ")
+	mode = Copy.{ bid = "b" }
+	loop key in ["G", "[", "["] do discard mode.key(prompts, key)
+	assert! prompts.copy(0, mode.y, 5, mode.y) == "$ cmd1"
+	wide :: ghostty.blank(60, 1) or panic!($.message())
+	defer wide.free()
+	wide.write("中 https://x.io/a, at (~/src/rx) 1234 abc1234f done.")
+	assert! (loop hit in hits(wide, 0) do "{hit.x}:{hit.text}").join(" ") == "3:https://x.io/a 23:~/src/rx 38:abc1234f"
+	left, right := word(wide, 1, 0)
+	start, end := word(wide, 5, 0)
+	assert! left == 0 && right == 1 && start == 3 && end == 17
+}

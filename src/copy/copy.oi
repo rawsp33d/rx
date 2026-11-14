@@ -1,0 +1,191 @@
+use math.{ min, max, clamp }
+use ghostty
+
+# rows count from the top of history
+pub Copy :: struct {
+	pub bid: string # "" when off
+	pub x: int, pub y: int, pub ax: int, pub ay: int
+	pub sel: string # "v" characters, "V" lines, "ctrl+v" a block, "" nothing
+	pub needle: string
+	pub marks: []int
+	pub back: bool # searched up, with ?
+}
+
+Copy :< {
+	pub key :: fn(mut self; term: ghostty.Term, key: string) (yank: string, done: bool) {
+		if key in ["q", "esc", "ctrl+c", "i", "I", "a", "A", "c", "C"] do return ("", true)
+		if key in ["y", "enter", "O"] do return (self.copy(term), true)
+		if key == "Y" do return (term.copy(self.x, self.y, term.cols() - 1, self.y), true)
+		if key in ["v", "V", "ctrl+v"] {
+			if self.sel == "" {
+				self.ax = self.x
+				self.ay = self.y
+			}
+			self.sel = if self.sel == key do "" else do key
+		} else if key == "[" || key == "]" {
+			# put the viewport on the cursor's row, prompts jump from there
+			top, _, _ := term.viewport()
+			if self.y != top do discard term.scroll(self.y - top)
+			if !term.prompt(if key == "[" do -1 else do 1) do return ("", false)
+			at, _, _ := term.viewport()
+			self.go(term, 0, at)
+		} else if key == "n" || key == "N" {
+			cols :: term.cols()
+			self.marks = term.find(self.needle)
+			at :: seek(self.marks, self.y * cols + self.x, self.back != (key == "N"))
+			if at < 0 do return ("", false)
+			self.go(term, at % cols, at / cols)
+		} else {
+			x, y, ok :: motion(term, key, self.x, self.y)
+			if !ok do return ("", false)
+			self.go(term, x, y)
+		}
+		ax, ay, bx, by := self.ends(term)
+		term.select(ax, if self.sel == "" do -1 else do ay, bx, by, self.sel == "ctrl+v")
+		("", false)
+	}
+
+	pub go :: fn(mut self; term: ghostty.Term, x, y: int) {
+		top, rows, total :: term.viewport()
+		self.x = clamp(x, 0, term.cols() - 1)
+		self.y = clamp(y, 0, total - 1)
+		if self.y < top do discard term.scroll(self.y - top)
+		if self.y >= top + rows do discard term.scroll(self.y - top - rows + 1)
+	}
+
+	pub copy :: fn(self; term: ghostty.Term) string {
+		if self.sel == "" do return ""
+		ax, ay, bx, by := self.ends(term)
+		term.copy(ax, ay, bx, by, self.sel == "ctrl+v")
+	}
+
+	pub ends :: fn(self; term: ghostty.Term) (ax, ay, bx, by: int) {
+		if self.sel == "V" do return (0, min(self.ay, self.y), term.cols() - 1, max(self.ay, self.y))
+		(self.ax, self.ay, self.x, self.y)
+	}
+
+	pub cursor :: fn(self; term: ghostty.Term, x, y, w, h: int) (seq: string, cx, cy: int) {
+		top, _, _ := term.viewport()
+		row :: self.y - top
+		if row < 0 || row >= h || self.x >= w do return ("\e[?25l", -1, -1)
+		("\e[2 q\e[{y + row + 1};{x + self.x + 1}H\e[?25h", x + self.x, y + row)
+	}
+}
+
+motion :: fn(term: ghostty.Term, key: string, x, y: int) (nx, ny: int, ok: bool) {
+	top, rows, total :: term.viewport()
+	cols :: term.cols()
+	if key in ["h", "left", "backspace"] do return (x - 1, y, true)
+	if key in ["l", "right"] do return (x + 1, y, true)
+	if key in ["k", "up", "ctrl+p"] do return (x, y - 1, true)
+	if key in ["j", "down", "ctrl+n"] do return (x, y + 1, true)
+	if key in ["0", "home"] do return (0, y, true)
+	if key in ["$", "end"] {
+		i := cols - 1
+		loop i > 0 && class(term.rune_at(i, y)) == 0 do i -= 1
+		return (i, y, true)
+	}
+	if key == "^" {
+		i := 0
+		loop i < cols - 1 && class(term.rune_at(i, y)) == 0 do i += 1
+		return (i, y, true)
+	}
+	if key == "g" do return (0, 0, true)
+	if key == "G" do return (0, total - 1, true)
+	if key == "H" do return (x, top, true)
+	if key == "M" do return (x, top + rows / 2, true)
+	if key == "L" do return (x, top + rows - 1, true)
+	if key == "ctrl+u" do return (x, y - rows / 2, true)
+	if key == "ctrl+d" do return (x, y + rows / 2, true)
+	if key in ["ctrl+b", "pageup"] do return (x, y - rows, true)
+	if key in ["ctrl+f", "pagedown"] do return (x, y + rows, true)
+	if key !in ["w", "b", "e"] do return (x, y, false)
+	cells :: total * cols
+	at :: fn(i: int) int { class(term.rune_at(i % cols, i / cols)) }
+	i := y * cols + x
+	if key == "w" {
+		kind :: at(i)
+		loop i < cells - 1 && kind != 0 && at(i) == kind do i += 1
+		loop i < cells - 1 && at(i) == 0 do i += 1
+	} else if key == "b" {
+		if i > 0 do i -= 1
+		loop i > 0 && at(i) == 0 do i -= 1
+		kind :: at(i)
+		loop i > 0 && at(i - 1) == kind do i -= 1
+	} else {
+		if i < cells - 1 do i += 1
+		loop i < cells - 1 && at(i) == 0 do i += 1
+		kind :: at(i)
+		loop i < cells - 1 && at(i + 1) == kind do i += 1
+	}
+	(i % cols, i / cols, true)
+}
+
+seek :: fn(at: []int, from: int, back: bool) int {
+	count :: at.len()
+	if count == 0 do return -1
+	if back {
+		loop i in 0..count {
+			if at[count - 1 - i] < from do return at[count - 1 - i]
+		}
+		return at[count - 1]
+	}
+	loop mark in at {
+		if mark > from do return mark
+	}
+	at[0]
+}
+
+class :: fn(code: int) int {
+	if code == 0 || code == ' ' || code == '\t' do return 0
+	if code == '_' || code >= '0' && code <= '9' || code >= 'a' && code <= 'z' || code >= 'A' && code <= 'Z' || code > 127 {
+		return 1
+	}
+	2
+}
+
+# like vi's W, so paths copy whole
+pub word :: fn(term: ghostty.Term, x, y: int) (int, int) {
+	blank :: fn(i: int) bool { class(term.rune_at(i, y)) == 0 && !term.tail(i, y) }
+	kind :: blank(x)
+	left, right := x, x
+	loop left > 0 && blank(left - 1) == kind do left -= 1
+	loop right < term.cols() - 1 && blank(right + 1) == kind do right += 1
+	(left, right)
+}
+
+pub Hit :: struct { pub text: string, pub x: int, pub y: int }
+
+pub hits :: fn(term: ghostty.Term, y: int) []Hit {
+	line := ""
+	at := []int.{}
+	loop x in 0..term.cols() {
+		if term.tail(x, y) do continue
+		code :: term.rune_at(x, y)
+		char :: if code == 0 do " " else do rune.(code).str()
+		loop 0..char.len() do at << x
+		line += char
+	}
+	out := []Hit.{}
+	i := 0
+	loop i < line.len() {
+		j := i
+		loop j < line.len() && line[j] != ' ' do j += 1
+		from, to := i, j
+		loop from < to && "([{{<'\"`".contains(line[from..(from + 1)]) do from += 1
+		loop to > from && ")]}}>'\"`.,:;!?".contains(line[(to - 1)..to]) do to -= 1
+		text :: line[from..to]
+		if worth(text) do out << Hit.{ text = text, x = at[from], y = y }
+		i = j + 1
+	}
+	out
+}
+
+worth :: fn(text: string) bool {
+	if text.contains("://") || text.len() > 1 && text.contains("/") do return true
+	if text.len() < 7 || text.len() > 40 do return false
+	loop i in 0..text.len() {
+		if !(text[i] >= '0' && text[i] <= '9' || text[i] >= 'a' && text[i] <= 'f') do return false
+	}
+	true
+}
