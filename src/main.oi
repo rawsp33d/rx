@@ -163,6 +163,7 @@ out :: fn(text: string) {
 
 popen : fn(cmd: cstr, mode: cstr) ptr : foreign
 pclose : fn(f: ptr) i32 : foreign
+fflush : fn(f: ptr) i32 : foreign
 
 # popen by hand, os.sh keeps no output
 zoxide :: fn(query: string) !string {
@@ -375,6 +376,10 @@ ask :: fn(
 		}
 	}
 }
+toggle :: fn(items: []string, item: string) []string {
+	if item in items do return items.filter({ $ != item })
+	[..items, item]
+}
 minimized :: fn(win: Window) bool {
 	win.layers.any({ ($.state or "") == "minimized" })
 }
@@ -575,21 +580,59 @@ Pane :< {
 	}
 }
 
+Pipe :: struct {
+	bid: string
+	id: int
+	stream: rex.Stream
+	strip: strip.Strip
+	got: string
+	live: bool
+	read: int
+	file: ptr
+}
+
+Pipe :< {
+	feed :: fn(mut self; data: string) {
+		self.read += data.len()
+		buf := data
+		if !self.live {
+			self.got += data
+			term, rest := ghostty.decode(self.got) or return
+			term.free()
+			buf = self.got[rest..]
+			self.got = ""
+			self.live = true
+		}
+		vt :: self.strip.feed(buf)
+		self.strip.msgs = []
+		if vt == "" do return
+		discard unsafe libc.fwrite(vt.ptr, 1, usize.(vt.len()), self.file)
+		discard unsafe fflush(self.file)
+	}
+
+	close :: fn(self) {
+		self.stream.close()
+		file :: self.file
+		discard sync.spawn! { discard unsafe pclose(file) } # don't wait on a command that won't end
+	}
+}
+
 Client :: struct {
-	conn: rex.Rex
-	sock, sid, cid: string
+	conn, aux: rex.Rex # aux is for pipes, Rex gives a client one stream per block
+	sock, sid, cid, aux_cid: string
 	bid, wid: string
 	last_wid, prev: string # for tab.last and session.last
 	last_bid: [string]string # for pane.last
 	view: View
 	panes: []Pane
+	pipes: []Pipe
 	chunks: sync.Chan[rex.Chunk]
 	keys: sync.Chan[string]
 	unread: string
-	streams, cols, rows, revision, peers: int
+	streams, cols, rows, revision, edits, peers: int
 	modes: string
 	owned: bool
-	full, readonly, mouse_off, dim: bool
+	full, readonly, mouse_off, dim, recording: bool
 	frames: bool # like tmux's pane-border-status bottom
 	choose, detach: bool
 	next, dir: string
@@ -618,7 +661,10 @@ Client :: struct {
 	click, flash: string
 	click_at: time.Instant
 	tabs: []int
-	belled: []string
+	marked: string
+	synced, grouped, belled: []string
+	tape, macro: string
+	mark: int
 }
 
 Client :< {
@@ -940,13 +986,66 @@ Client :< {
 		self.panes[i] = pane
 	}
 
+	pipe :: fn(mut self; bid, cmd: string) ! {
+		file :: unsafe popen("RX_PANE={quote(bid)} sh -c {quote(cmd)}".cstr(), "w".cstr())
+		if file.is_null() do return error("cannot run {cmd}")
+		self.streams += 1
+		stream :: self.aux_data(bid) or {
+			discard unsafe pclose(file)
+			return $
+		}
+		self.pipes << Pipe.{ bid = bid, id = self.streams, stream = stream, strip = strip.Strip.new(stream.nonce), file = file }
+	}
+
+	aux_data :: fn(mut self; bid: string) !rex.Stream {
+		if self.aux_cid == "" {
+			self.aux = rex.connect(self.sock)?
+			att :: self.aux.call[Attached]("session.attach", ["session_id" = self.sid]) or {
+				self.aux.close()
+				return $
+			}
+			self.aux_cid = att.client_id
+		}
+		self.aux.data(self.sid, bid, self.streams, self.chunks)
+	}
+
+	unpipe :: fn(mut self; bid: string) bool {
+		was :: self.pipes.len()
+		self.pipes = loop pipe in self.pipes {
+			if pipe.bid == bid || bid == "" {
+				pipe.close()
+				continue
+			}
+			pipe
+		}
+		if self.pipes.len() == 0 && self.aux_cid != "" {
+			self.aux.close()
+			self.aux_cid = ""
+		}
+		self.pipes.len() < was
+	}
+
 	close :: fn(mut self) {
 		loop pane in self.panes do pane.close()
 		self.panes = []
+		discard self.unpipe("")
 		self.chunks.close()
 	}
 
 	data :: fn(mut self; chunk: rex.Chunk) {
+		loop i in 0..self.pipes.len() {
+			if self.pipes[i].id != chunk.id do continue
+			data :: chunk.data or {
+				pipe :: self.pipes[i]
+				self.pipes[i].stream = pipe.stream.resume(pipe.read) or {
+					self.unpipe(pipe.bid)
+					return
+				}
+				return
+			}
+			self.pipes[i].feed(data)
+			return
+		}
 		loop i in 0..self.panes.len() {
 			if self.panes[i].id != chunk.id do continue
 			data :: chunk.data or {
@@ -1032,6 +1131,10 @@ Client :< {
 			self.full = true
 		}
 		if self.drag.edge do self.select(self.drag, self.drag.px, self.drag.py, false)
+		loop self.aux_cid != "" {
+			self.aux.take(self.aux.inbox.try_recv() or break) or break
+			loop { discard self.aux.queued() or break }
+		}
 		self.draw()
 	}
 
@@ -1108,7 +1211,11 @@ Client :< {
 		plain := label
 		modes: []string = loop mode in self.modes_on do mode
 		if self.cp.bid != "" do modes << "copy"
+		if self.marked != "" do modes << "marked"
+		if self.bid in self.grouped do modes << "group {self.grouped.len()}"
 		if self.readonly do modes << "ro"
+		if self.recording do modes << "rec"
+		if self.pipes.any({ $.bid == self.bid }) do modes << "piped"
 		if self.peers > 0 do modes << "+{self.peers} attached"
 		loop mode in modes {
 			line += "\e[0;1;35m {mode}"
@@ -1123,11 +1230,19 @@ Client :< {
 			tabs << cells(plain)
 			wid :: win.window_id
 			name :: self.tab_name(win)
-			flags :: (if win.zoomed_block_id != none do " Z" else do "") + (if minimized(win) do " M" else do "") +
-				(if win.window_id in self.tiling do " T" else do "") + (if win.window_id in self.belled do " !" else do "") + marks[urgency(self.win_state(win))]
-			current :: win.window_id == active
-			line += (if current do "\e[0;30;42m " else do "\e[0m ") + "{i + 1}" + (if name != "" do " " + name else do "") + (if current do "" else do "\e[33m") + flags + " "
-			plain += " {i + 1}" + (if name != "" do " " + name else do "") + flags + " "
+			tab :: "{i + 1}" + if name != "" do " " + name else do ""
+
+			flags := ""
+			if win.zoomed_block_id != none do flags += " Z"
+			if minimized(win) do flags += " M"
+			if wid in self.synced do flags += " S"
+			if wid in self.tiling do flags += " T"
+			if wid in self.belled do flags += " !"
+			flags += marks[urgency(self.win_state(win))]
+
+			current :: wid == active
+			line += (if current do "\e[0;30;42m " else do "\e[0m ") + tab + (if current do "" else do "\e[33m") + flags + " "
+			plain += " " + tab + flags + " "
 		}
 		tabs << cells(plain)
 		self.tabs = tabs
@@ -1305,6 +1420,10 @@ Client :< {
 			}
 			parsed, used := keys.key_of(buf)
 			self.unread = buf[used..]
+			if self.recording {
+				if self.typed.len() == 0 do self.mark = self.tape.len()
+				self.tape += buf[..used]
+			}
 			key :: parsed or {
 				pass += buf[..used]
 				continue
@@ -1331,6 +1450,7 @@ Client :< {
 				continue
 			}
 			self.typed = []
+			if self.recording && hit.action.starts_with("macro.") do self.tape = self.tape[..self.mark]
 			self.write(pass)?
 			pass = ""
 			if self.perform(hit, key) or { self.say($.message(), true); false } do return true
@@ -1609,11 +1729,57 @@ Client :< {
 		self.act(items[pick].action, Json.(items[pick].args))
 	}
 
+	number :: fn(mut self) ! {
+		# plain keys, or the digit's release reaches the program
+		frame := reset_modes + "\e[?2026h"
+		self.modes = ""
+		loop i in 0..min(self.panes.len(), 9) {
+			pane :: self.panes[i]
+			color :: if pane.bid == self.bid do "\e[30;42m" else do "\e[30;44m"
+			frame += "\e[{pane.y + pane.h / 2 + 1};{pane.x + max(pane.w / 2 - 1, 0) + 1}H" + color + " {i + 1} \e[0m"
+		}
+		out(frame + "\e[?25l\e[?2026l")
+		key :: self.next_key()
+		self.redraw()
+		i :: int.try_from((key or return ()).text) or return ()
+		if i >= 1 && i <= min(self.panes.len(), 9) do self.focus(self.panes[i - 1].bid)?
+	}
+
 	next_key :: fn(mut self) ?keys.Key {
 		if self.unread == "" do self.unread = self.keys.recv() or return none
 		key, used := keys.key_of(self.unread)
 		self.unread = self.unread[used..]
 		key
+	}
+
+	clock :: fn(mut self) {
+		out(reset_modes)
+		self.modes = ""
+		loop {
+			pane :: self.focused() or break
+			now :: time.Time.now().format("%H:%M")
+			rows :: if pane.w >= 34 && pane.h >= 5 do big(now) else do [now]
+			frame := "\e[?2026h\e[0m"
+			loop y in pane.y..(pane.y + pane.h) do frame += "\e[{y + 1};{pane.x + 1}H\e[{pane.w}X"
+			y0, x0 :: pane.y + (pane.h - rows.len()) / 2, pane.x + max(pane.w - cells(rows[0]), 0) / 2
+			loop i in 0..rows.len() do frame += "\e[{y0 + i + 1};{x0 + 1}H\e[34m" + fit(rows[i], pane.w)
+			out(frame + "\e[0m\e[?25l\e[?2026l")
+			got := self.unread
+			if got == "" {
+				sync.select! {
+					data := <-self.keys => {
+						got = data or " "
+						()
+					},
+					sync.after(1.sec()) => {},
+				}
+			}
+			if got == "" do continue
+			_, used := keys.key_of(got)
+			self.unread = got[used..]
+			break
+		}
+		self.redraw()
 	}
 
 	quick :: fn(mut self) ! {
@@ -1837,7 +2003,9 @@ Client :< {
 	}
 
 	others :: fn(mut self) ![]Peer {
-		loop peer in self.call[Clients]("session.list_clients")?.clients or [] { if (peer.client_id or "") == self.cid do continue; peer }
+		mine :: [self.cid, self.aux_cid]
+		peers :: self.call[Clients]("session.list_clients")?.clients or []
+		peers.filter({ ($.client_id or "") !in mine })
 	}
 
 	kick :: fn(mut self; peer: Peer) ! {
@@ -1901,12 +2069,33 @@ Client :< {
 				self.ok("session.move_block", ["block_id" = self.bid, "anchor_block_id" = tab.block_ids[0]])?
 				self.ok("block.close", ["block_id" = tab.block_ids[0]])?
 			},
+			"pane.mark" => {
+				self.marked = if self.marked == self.bid do "" else do self.bid
+				self.redraw()
+			},
+			"pane.join" => {
+				if self.marked == "" || self.marked == self.bid do return error("no marked pane")
+				self.ok("session.move_block", ["block_id" = self.marked, "anchor_block_id" = self.bid, "direction" = axis(dir), "side" = side(dir)])?
+				self.marked = ""
+				self.draw()
+			},
 			"pane.rotate" => {
 				layer :: self.layer_of(self.bid) or return error("no pane")
 				bids: []string = loop leaf in leaves(layer.layout or :null) do leaf.bid
 				loop (from, to) in rotation(bids, dir == "up") {
 					self.ok("session.swap_blocks", ["block_id" = from, "other_block_id" = to])?
 				}
+			},
+			"pane.edit" => {
+				pane :: self.painted()?
+				_, _, total := pane.term.viewport()
+				self.edits += 1
+				path :: (os.env("XDG_RUNTIME_DIR") or "/tmp") + "/rx-{os.pid()}-{self.edits}.txt"
+				fs.write(fs.Path.(path), pane.term.copy(0, 0, pane.term.cols() - 1, total - 1) + "\n")?
+				quoted :: quote(path)
+				self.pop("${{EDITOR:-vi}} {quoted}")?
+				# can't rm from the pane, closing it kills everything in it. 5s is plenty for the editor
+				discard os.sh("(sleep 5; rm -f {quoted}) >/dev/null 2>&1 &")
 			},
 			"pane.close" => self.ok("block.close", ["block_id" = self.bid])?,
 			"pane.zoom" => self.ok("session.zoom_block")?,
@@ -1917,8 +2106,11 @@ Client :< {
 				self.ok("session.resize_layer", ["layer_id" = layer.layer_id or "", "bounds" = shift(layer.bounds, dir, self.frac(dir, opts.cells or 2))])?
 			},
 			"pane.swap" => {
-				other :: self.beside(dir) or return error("no pane {dir}")
-				self.ok("session.swap_blocks", ["block_id" = self.bid, "other_block_id" = other.bid])?
+				other := self.marked
+				if opts.direction != none || other == "" {
+					other = (self.beside(dir) or return error("no pane {dir}")).bid
+				}
+				self.ok("session.swap_blocks", ["block_id" = self.bid, "other_block_id" = other])?
 			},
 			"layer.float" => self.float()?,
 			"pane.copy" => {
@@ -1953,6 +2145,8 @@ Client :< {
 				}
 				return self.perform(keymap.Binding.{ action = typed[0], args = Json.(args) }, keys.Key.{})
 			},
+			"pane.choose" => self.number()?,
+			"pane.clock" => self.clock(),
 			"pane.hints" => self.quick()?,
 			"pane.find" => {
 				query :: self.ask("find: ").lower()
@@ -1977,6 +2171,26 @@ Client :< {
 				self.landed()
 			},
 			"client.palette" => return self.palette()?,
+			"pane.pipe" => {
+				if self.unpipe(self.bid) do return false
+				self.pipe(self.bid, opts.command or return error("pane.pipe needs a command"))?
+				self.draw()
+			},
+			"pane.run" => {
+				cmd :: opts.command or return error("pane.run needs a command")
+				discard os.sh("RX_PANE={quote(self.bid)} sh -c {quote(cmd)} </dev/null >/dev/null 2>&1 &")
+			},
+			"macro.record" => {
+				if self.recording do self.macro = self.tape
+				self.recording = !self.recording
+				self.tape = ""
+				self.draw()
+			},
+			"macro.play" => {
+				if self.recording do return error("recording, can't replay")
+				self.unread = self.macro + self.unread
+				if self.macro == "" do return error("nothing recorded")
+			},
 			"pane.titles" => {
 				self.frames = !self.frames
 				self.fetch_status()
@@ -2047,6 +2261,14 @@ Client :< {
 			"tab.even" => {
 				layer :: self.layer_of(self.bid) or return error("no pane")
 				loop split in evened(layer.layout or :null) do self.ratio(split, split.ratio)?
+			},
+			"pane.group" => {
+				self.grouped = toggle(self.grouped, self.bid)
+				self.draw()
+			},
+			"tab.sync" => {
+				self.synced = toggle(self.synced, self.wid)
+				self.redraw()
 			},
 			"tab.layout" => self.relayout_tab(opts.layout or "next")?,
 			"tab.tile" => {
@@ -2226,6 +2448,7 @@ Client :< {
 		}
 		if "error" !in reply do reply["result"] = :null
 		discard self.conn.call[Ok]("client.reply", reply)?
+		if !detach && self.unread != "" do return self.input("")
 		detach
 	}
 
@@ -2261,8 +2484,15 @@ Client :< {
 
 	write :: fn(mut self; data: string) ! {
 		if data == "" do return ()
-		loop pane in self.panes {
-			if pane.bid == self.bid && pane.painted && pane.term.scroll(0) do self.redraw()
+		if pane := self.focused(), pane.painted && pane.term.scroll(0) do self.redraw()
+		# TODO: synced panes get mouse reports meant for the focused one
+		if self.bid in self.grouped {
+			loop bid in self.grouped do self.term(bid, "write", ["data" = data]) or {}
+			return ()
+		}
+		if self.wid in self.synced {
+			loop pane in self.panes do self.term(pane.bid, "write", ["data" = data])?
+			return ()
 		}
 		self.term(self.bid, "write", ["data" = data])?
 	}
@@ -2304,6 +2534,24 @@ describe :: fn(peer: Peer) string {
 	line := peer.principal.display + "  " + (info.label or info.name or "?") + " " + (info.version or "")
 	if (peer.connection_state or "") == "lost" do line += "  (lost)"
 	line
+}
+
+big :: fn(text: string) []string {
+	glyphs :: ["####.##.##.####", "..#..#..#..#..#", "###..#####..###", "###..####..####", "#.##.####..#..#",
+		"####..###..####", "####..####.####", "###..#..#..#..#", "####.#####.####", "####.####..####"]
+	loop line in 0..5 {
+		row := ""
+		loop i in 0..text.len() {
+			if i > 0 do row += "  "
+			glyph :: if text[i] == ':' {
+				".#.#."[line..(line + 1)]
+			} else {
+				glyphs[int.(text[i] - '0')][(line * 3)..(line * 3 + 3)]
+			}
+			loop col in 0..glyph.len() do row += if glyph[col] == '#' do "██" else do "  "
+		}
+		row
+	}
 }
 
 fit :: fn(text: string, width: int) string {
