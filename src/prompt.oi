@@ -1,8 +1,45 @@
+use json
+use json.{ Json }
+
+pub complete :: fn(line: string, names: []string, args: [string][]string = .[]) string {
+	cut := line.len()
+	loop cut > 0 && line[cut - 1] != ' ' do cut -= 1
+	head, word :: line[..cut], line[cut..]
+	pool :: if cut == 0 do names else do args[line.split(" ")[0]] or []
+	fits :: pool.filter({ $.starts_with(word) })
+	if fits.len() == 0 do return line
+	if fits.len() == 1 do return head + fits[0] + if fits[0].ends_with("=") do "" else do " "
+	prefix := fits[0]
+	loop fit in fits {
+		loop !fit.starts_with(prefix) do prefix = prefix[..(prefix.len() - 1)]
+	}
+	head + prefix
+}
+
 pub chop :: fn(line: string) string {
 	if line == "" do return line
 	end := line.len() - 1
 	loop end > 0 && line[end] & 0xc0 == 0x80 do end -= 1
 	line[..end]
+}
+
+pub value :: fn(text: string) Json {
+	json.parse(text) or Json.(text)
+}
+
+pub words :: fn(line: string) []string {
+	out := []string.{}
+	word := ""
+	quoted := false
+	loop i in 0..line.len() {
+		if line[i] == '"' && (i == 0 || line[i - 1] != '\\') do quoted = !quoted
+		if line[i] == ' ' && !quoted {
+			if word != "" do out << word
+			word = ""
+		} else do word += line[i..(i + 1)]
+	}
+	if word != "" do out << word
+	out
 }
 
 pub fuzzy :: fn(query, text: string) bool {
@@ -20,4 +57,12 @@ test! "chop" {
 
 test! "fuzzy" {
 	assert! fuzzy("zp", "Zoom Pane") && !fuzzy("pz", "Zoom Pane")
+}
+
+test! "complete and words" {
+	assert! complete("pane.s", ["pane.split", "pane.swap", "tab.new"]) == "pane.s" && complete("pane.sp", ["pane.split", "pane.swap"]) == "pane.split "
+	args: [string][]string = ["pane.resize" = ["direction=", "direction=right", "direction=down", "cells="]]
+	assert! complete("pane.resize c", [], args) == "pane.resize cells=" && complete("pane.resize direction=r", [], args) == "pane.resize direction=right "
+	got :: words(" layer.new  command=\"a \\\"b\\\" c\" cells=2 ")
+	assert! got.len() == 3 && got[1] == "command=\"a \\\"b\\\" c\"" && value(got[2].split("=")[1]).str() == "2"
 }

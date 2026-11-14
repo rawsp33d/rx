@@ -14,7 +14,7 @@ use strip
 use keys
 use keymap
 use ghostty
-use prompt.{ chop, fuzzy }
+use prompt.{ complete, chop, value, words, fuzzy }
 use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift, border }
 use copy.{ Copy, Hit, hits, word }
 use encoding.base64
@@ -351,7 +351,9 @@ manage :: fn(sock, method: string, payload: Obj) ![]Session {
 	conn.call[Sessions]("session.list")?.sessions
 }
 
-ask :: fn(prompt: string, input: sync.Chan[string], at: string, pending := "") (line, rest: string) {
+ask :: fn(
+	prompt: string, input: sync.Chan[string], at: string, pending := "", names: []string = [], args: [string][]string = .[],
+) (line, rest: string) {
 	rest = pending
 	loop {
 		out(at + "{prompt}{line}\e[?25h")
@@ -369,7 +371,7 @@ ask :: fn(prompt: string, input: sync.Chan[string], at: string, pending := "") (
 			if name == "enter" do return
 			if name in ["esc", "ctrl+c"] do return ("", rest)
 			if name in ["backspace", "ctrl+h"] do line = chop(line)
-			line += key.text
+			if name == "tab" do line = complete(line, names, args) else do line += key.text
 		}
 	}
 }
@@ -598,6 +600,7 @@ Client :: struct {
 	typed: [][]string
 	eaten: []string # keys a binding took, their release and repeats drop too
 	titles: [string]string
+	arg_words: [string][]string
 	areas: []Area
 	msg, shown, hinted: string
 	msg_at: time.Instant
@@ -1032,10 +1035,10 @@ Client :< {
 		self.draw()
 	}
 
-	ask :: fn(mut self; prompt: string) string {
+	ask :: fn(mut self; prompt: string, names: []string = [], args: [string][]string = .[]) string {
 		out(reset_modes)
 		self.modes = ""
-		line, rest :: ask(prompt, self.keys, "\e[{self.rows};1H\e[0m\e[2K ", self.unread)
+		line, rest :: ask(prompt, self.keys, "\e[{self.rows};1H\e[0m\e[2K ", self.unread, names, args)
 		self.unread = rest
 		self.redraw()
 		line
@@ -1663,6 +1666,23 @@ Client :< {
 		if shifted do self.paste(pane)? else do self.say("copied")
 	}
 
+	palette :: fn(mut self) !bool {
+		all := []keymap.Action.{}
+		loop action in keymap.declared()? do all << action
+		loop action in self.km.actions or [] do all << action
+		all = loop action in all { if (action.title or "") == "" || action.name !in self.can do continue; action }
+		i :: self.choose(self.titles["client.palette"] or "", loop action in all do action.title or "")
+		if i < 0 do return false
+		action :: all[i]
+		args: Obj = []
+		loop arg in (action.args or keymap.Schema.{}).required or [] {
+			answer :: self.ask("{action.title or action.name} {arg}: ")
+			if answer == "" do return false
+			args[arg] = value(answer)
+		}
+		self.perform(keymap.Binding.{ action = action.name, args = Json.(args) }, keys.Key.{})
+	}
+
 	choose :: fn(mut self; title: string, items: []string) int {
 		self.modes = ""
 		i, _, _, rest :: choose(title, items, self.keys, self.unread)
@@ -1922,6 +1942,17 @@ Client :< {
 			},
 			"client.detach_others" => loop peer in self.others()? do self.kick(peer)?,
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
+			"client.prompt" => {
+				typed :: words(self.ask(": ", self.can.keys, self.arg_words))
+				if typed.len() == 0 do return false
+				args: Obj = []
+				loop kv in typed[1..] {
+					pair :: kv.split("=")
+					if pair.len() < 2 do return error("{kv}: want name=value")
+					args[pair[0]] = value(pair[1..].join("="))
+				}
+				return self.perform(keymap.Binding.{ action = typed[0], args = Json.(args) }, keys.Key.{})
+			},
 			"pane.hints" => self.quick()?,
 			"pane.find" => {
 				query :: self.ask("find: ").lower()
@@ -1945,6 +1976,7 @@ Client :< {
 				self.focus(bids[i])?
 				self.landed()
 			},
+			"client.palette" => return self.palette()?,
 			"pane.titles" => {
 				self.frames = !self.frames
 				self.fetch_status()
@@ -2205,10 +2237,15 @@ Client :< {
 		self.hash = km.config.hash
 		self.typed = []
 		titles: [string]string = .[]
+		arg_words: [string][]string = .[]
 		all := keymap.declared()?
 		loop action in km.actions or [] do all << action
-		loop action in all do titles[action.name] = action.title or action.name
+		loop action in all {
+			titles[action.name] = action.title or action.name
+			arg_words[action.name] = keymap.arg_words(action)
+		}
 		self.titles = titles
+		self.arg_words = arg_words
 		self.peers = (self.others() or []).len()
 	}
 

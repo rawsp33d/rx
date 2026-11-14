@@ -29,6 +29,8 @@ pub REQUEST :: r"""{
 		{"name": "pane.paste", "kind": "client", "title": "Paste Last Copy"},
 		{"name": "pane.find", "kind": "client", "title": "Find in Any Pane"},
 		{"name": "pane.hints", "kind": "client", "title": "Copy Text by Hint"},
+		{"name": "client.palette", "kind": "client", "title": "Command Palette"},
+		{"name": "client.prompt", "kind": "client", "title": "Command Prompt"},
 		{"name": "buffer.choose", "kind": "client", "title": "Paste an Earlier Copy"},
 		{"name": "client.choose", "kind": "client", "title": "Detach a Client"},
 		{"name": "client.detach_others", "kind": "client", "title": "Detach Other Clients"},
@@ -64,7 +66,8 @@ pub REQUEST :: r"""{
 }"""
 
 pub Binding :: struct { pub keys: []string, pub action: string, pub args: ?Json, pub mode: ?string }
-pub Action :: struct { pub name: string, pub title: ?string }
+pub Action :: struct { pub name: string, pub title: ?string, pub args: ?Schema }
+pub Schema :: struct { pub required: ?[]string, pub properties: ?Json }
 pub Config :: struct { pub hash: string }
 pub Mode :: struct { pub name: string, pub exclusive: bool, pub blocked: ?[][]string }
 
@@ -75,12 +78,26 @@ pub Keymap :: struct { pub bindings: []Binding, pub actions: ?[]Action, pub mode
 Request :: struct { pub actions: []Action }
 
 pub request :: fn() !Obj {
-	j :: json.parse(REQUEST)?
-	match j {
-		is Obj => j,
-		_ => error("keymap: REQUEST isn't an object"),
-	}
+	json.parse(REQUEST)? |> obj
 }
+
+pub arg_words :: fn(action: Action) []string {
+	out := []string.{}
+	props :: obj((action.args or Schema.{}).properties or :null)
+	loop name in props.keys {
+		out << name + "="
+		loop value in arr(obj(props[name] or :null)["enum"] or :null) {
+			match value {
+				is string => { out << name + "=" + value; () },
+				_ => {},
+			}
+		}
+	}
+	out
+}
+
+obj :: fn(value: Json) Obj { match value { is Obj => value, _ => [] } }
+arr :: fn(value: Json) json.Arr { match value { is json.Arr => value, _ => [] } }
 
 pub declared :: fn() ![]Action {
 	json.decode[Request](REQUEST)?.actions
