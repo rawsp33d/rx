@@ -73,29 +73,53 @@ cli :: fn(args: []string) ! {
 		},
 		"kill" => proxy(sock, "kill", args[1..]),
 		"rename" => proxy(sock, "session rename", args[1..]),
+		"dump" => return dump(sock, named(args[1..])),
 		"help", "-h", "--help" => {
 			print(usage)
 			return ()
 		},
 		else => {},
 	}
+	# a command after -- runs in place of a shell
+	command := []string.{}
+	sep :: args.index("--") or args.len()
+	if sep < args.len() do command = args[(sep + 1)..]
+	args = args[0..sep]
+	layout := ""
+	if i := args.index("-l") {
+		if i + 1 < args.len() do layout = args[i + 1]
+		args = loop arg, k in args { if k == i || k == i + 1 do continue; arg }
+	}
 	readonly, detached, alone :: "-r" in args, "-d" in args, "-D" in args
 	args = args.filter { $ !in ["-r", "-d", "-D"] }
 	cmd = if args.len() > 0 do args[0] else do ""
 	warp :: cmd in ["w", "warp"]
 	needs_name :: warp || cmd in ["j", "join"]
-	if needs_name do args = args[1..]
-	label :: if args.len() > 0 do named(args) else do "" # "" picks one
-	if args.len() > 1 || label.starts_with("-") || !(cmd in ["", "."] || needs_name) || needs_name && args.len() == 0 {
+	if needs_name || cmd == "run" do args = args[1..]
+	label :: if cmd == "run" || args.len() > 0 do named(args) else do "" # "" picks one
+	known :: needs_name || cmd in ["", ".", "run"]
+	nameless :: needs_name && args.len() == 0
+	stray :: command.len() > 0 && cmd != "run"
+	if !known || nameless || stray || args.len() > 1 || label.starts_with("-") {
 		eprint(usage)
 		os.exit(2)
 	}
-	if detached && label != "" do proxy(sock, "new", [label, "--cwd", if warp do zoxide(label)? else do os.cwd()]) # like tmux new -d
+	if detached && label != "" {
+		dir :: if warp do zoxide(label)? else do os.cwd()
+		if layout != "" {
+			discard create(sock, label, loop win in windows(layout)? do with_cwd(win, dir))?
+			return ()
+		}
+		rest := [label, "--cwd", dir]
+		if command.len() > 0 do rest << "--" << command
+		proxy(sock, "new", rest) # like tmux new -d
+	}
 	# only a bare . renames, a flag means attach or create
-	if cmd == "." && !readonly && !detached && !alone && (os.env("REX_SESSION") or "") != "" {
+	inside :: (os.env("REX_SESSION") or "") != ""
+	if cmd == "." && inside && !readonly && !detached && !alone && layout == "" {
 		proxy(sock, "session rename", [label])
 	}
-	run(sock, label, warp, readonly, alone)
+	run(sock, label, warp, readonly, alone, cmd == "run", command, layout)
 }
 
 named :: fn(args: []string) string {
@@ -105,7 +129,7 @@ named :: fn(args: []string) string {
 
 usage :: "rx, a Rex TUI client
 
-usage: rx [-S server] [command] [flags]
+usage: rx [-S server] [command] [flags] [-- cmd...]
 
 commands:
   (none)               interactive session browser
@@ -113,6 +137,8 @@ commands:
                        inside a session with no flags, renames it instead
   j, join name         create/join session in current dir
   w, warp name         create/join session after warping to the given dir (needs zoxide)
+  run [name] -- cmd    create session running cmd instead of a shell, no status line, like abduco
+  dump [name]          print a session as a layout file, for -l
   ls [-j, --json]      list sessions
   rename [session] name
                        rename a session, the current one by default
@@ -120,12 +146,113 @@ commands:
   help                 show this
 
 flags:
+  -l file     create a session from a layout file
   -r          read-only
   -d          don't attach
   -D          detach other clients
   -S server   unix socket or host:port, default $REX_SERVER
 
 name is a session label or id, . means the cwd's name"
+
+Layout :: struct { initial_windows: []Json }
+
+windows :: fn(path: string) !json.Arr {
+	fs.Path.(path) |> fs.read($)? |> json.decode[Layout]($)? |> $.initial_windows
+}
+
+create :: fn(sock, label: string, wins: json.Arr) !string {
+	conn := rex.connect(sock)?
+	defer conn.close()
+	plain: json.Arr = loop win in wins {
+		kept: Obj = []
+		loop value, key in obj(win) {
+			if key != "floats" do kept[key] = value
+		}
+		Json.(kept)
+	}
+	created :: conn.call[Created]("session.create", ["label" = label, "initial_windows" = plain])?
+	sid :: created.session_id
+	if plain.str() != Json.(wins).str() {
+		discard conn.call[Attached]("session.attach", ["session_id" = sid])?
+	}
+
+	loop win in wins, tab in created.initial_windows or [] {
+		loop layer in arr(obj(win)["floats"] or :null) {
+			discard conn.call[Ok]("session.new_layer", [
+				"session_id" = sid,
+				"window_id" = tab.window_id,
+				"bounds" = obj(layer)["bounds"] or :null,
+				"layout" = obj(layer)["layout"] or :null,
+			])?
+		}
+	}
+	sid
+}
+
+# TODO: commands, Rex keeps their arguments to itself. minimized floats come back shown
+dump :: fn(sock, label: string) ! {
+	conn := rex.connect(sock)?
+	defer conn.close()
+	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
+	sessions :: conn.call[Sessions]("session.list")?.sessions
+	session :: sessions.find({ $.label == label || $.session_id == label }) or return error("no session {label}")
+	sid :: session.session_id
+	empty: Obj = []
+	cwds: [string]string = .[]
+	wins: json.Arr = []
+	loop win in conn.call[View]("session.view", ["session_id" = sid])?.windows or [] {
+		entry: Obj = []
+		floats: json.Arr = []
+		if !default_label(win) do entry["window_label"] = win.label or ""
+		loop layer in win.layers {
+			loop leaf in leaves(layer.layout or :null) {
+				args: Obj = ["session_id" = sid, "block_id" = leaf.bid, "args" = empty]
+				cwds[leaf.bid] = (conn.call[Process]("com.superlogical.terminal.process", args) or Process.{}) |> rex.cwd($)
+			}
+			lay :: spec(layer.layout or :null, cwds)
+			if layer.kind == "tiled" {
+				entry["layout"] = lay
+			} else {
+				floats << ["bounds" = layer.bounds.map({ Json.($) }), "layout" = lay]
+			}
+		}
+		if floats.len() > 0 do entry["floats"] = floats
+		wins << Json.(entry)
+	}
+	Json.(["initial_windows" = wins]) |> $.str() |> print
+}
+
+with_cwd :: fn(node: Json, cwd: string) Json {
+	match node {
+		is json.Arr => Json.(loop item in node do with_cwd(item, cwd)),
+		is Obj => {
+			fields := node
+			loop key in node.keys do fields[key] = with_cwd(node[key] or :null, cwd)
+			flavor :: fields["flavor"] or :null
+			if !(match flavor { is string => flavor.starts_with("com.superlogical.terminal."), _ => false }) {
+				return Json.(fields)
+			}
+			opts := obj(fields["options"] or :null)
+			if "cwd" !in opts do opts["cwd"] = cwd
+			fields["options"] = opts
+			Json.(fields)
+		},
+		_ => node,
+	}
+}
+
+obj :: fn(value: Json) Obj { match value { is Obj => value, _ => [] } }
+arr :: fn(value: Json) json.Arr { match value { is json.Arr => value, _ => [] } }
+
+spec :: fn(tree: Json, cwds: [string]string) Json {
+	node :: json.from_json[Node](tree) or return :null
+	if bid := node.block_id do return Json.(rex.shell(cwds[bid] or ""))
+	split :: node.split or return :null
+	Json.(["split" = [
+		"direction" = split.direction, "ratio" = split.ratio,
+		"before" = spec(split.before, cwds), "after" = spec(split.after, cwds),
+	]])
+}
 
 default_label :: fn(win: Window) bool {
 	label :: win.label or ""
@@ -179,7 +306,7 @@ zoxide :: fn(query: string) !string {
 	string.(out).trim()
 }
 
-run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
+run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []string, layout: string) ! {
 	conn := rex.connect(sock)?
 	defer conn.close()
 	term :: tty.raw(0)?
@@ -202,7 +329,14 @@ run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 		}
 		# it would draw itself inside itself forever
 		if sid != "" && sid == (os.env("REX_SESSION") or "") do return error("already in {label}")
-		if sid == "" do sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = [["layout" = rex.shell(if dir != "" do dir else do os.cwd())]]])?.session_id
+		if sid == "" {
+			opts: Obj = []
+			if command.len() > 0 do opts["command"] = command.map({ Json.($) })
+			cwd :: if dir != "" do dir else do os.cwd()
+			wins: json.Arr = [["layout" = rex.shell(cwd, opts)]]
+			if layout != "" do wins = windows(layout)?.map({ with_cwd($, cwd) })
+			sid = create(sock, label, wins)?
+		}
 		if sid != cur do prev, cur = cur, sid
 		att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
 		view := att.view
@@ -210,7 +344,11 @@ run :: fn(sock, label: string, warp, readonly, alone: bool) ! {
 			discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
 			view = conn.call[View]("session.view", ["session_id" = sid])?
 		}
-		client := Client.{ conn = conn, sock = sock, sid = sid, cid = att.client_id, owned = !readonly, readonly = readonly, prev = prev, chunks = sync.Chan[rex.Chunk].{}, keys = input }
+		client := Client.{
+			conn = conn, sock = sock, sid = sid, cid = att.client_id,
+			owned = !readonly, readonly = readonly, bare = bare, prev = prev,
+			chunks = sync.Chan[rex.Chunk].{}, keys = input,
+		}
 		client.load_keymap()?
 		# like tmux attach -d
 		if alone {
@@ -632,7 +770,7 @@ Client :: struct {
 	streams, cols, rows, revision, edits, peers: int
 	modes: string
 	owned: bool
-	full, readonly, mouse_off, dim, recording: bool
+	full, readonly, bare, mouse_off, dim, recording: bool
 	frames: bool # like tmux's pane-border-status bottom
 	choose, detach: bool
 	next, dir: string
@@ -876,7 +1014,7 @@ Client :< {
 		size :: tty.size(1)?
 		self.cols = int.(size.cols)
 		self.rows = int.(size.rows)
-		h :: self.rows - 1
+		h :: self.rows - if self.bare do 0 else do 1
 		win :: self.win()
 		bid :: win.focused_block_id or ""
 		if win.window_id != self.wid && self.wid != "" {
@@ -1070,7 +1208,7 @@ Client :< {
 		frame := "\e[?2026h"
 		if all do frame += "\e[0m\e[H\e[2J"
 		bar :: self.bar()
-		if all || bar != self.shown {
+		if !self.bare && (all || bar != self.shown) {
 			frame += bar
 			self.shown = bar
 		}
@@ -1309,7 +1447,7 @@ Client :< {
 		if self.typed.len() == 0 && self.modes_on.len() == 0 do return ""
 		hints :: self.hints()
 		if hints.len() == 0 do return ""
-		bottom :: self.rows - 1
+		bottom :: self.rows - if self.bare do 0 else do 1
 		if bottom < 3 do return ""
 		rows, w := []string.{}, 0
 		loop cap in [24, 16, 12] {
@@ -1556,7 +1694,7 @@ Client :< {
 		self.drag = Drag.{} # lost the release
 		press :: !up && button & 96 == 0
 		left :: press && button & 3 == 0
-		if y == self.rows - 1 {
+		if y == self.rows - 1 && !self.bare {
 			if button & 98 == 64 do discard self.act(if button & 1 == 0 do "tab.previous" else do "tab.next", none)?
 			wid :: self.tab_at(x)
 			if press && button & 3 == 1 && wid != "" do self.ok("session.close_window", ["window_id" = wid])?
