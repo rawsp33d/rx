@@ -1,0 +1,645 @@
+use os
+use time
+use libc
+use tty
+use sync
+use json
+use json.{ Json, Obj }
+use rex
+use rex.{ Sessions, Created, Attached, Ok, View, Node, Rex1, Process, Outer }
+use keys
+use strip
+use ghostty
+
+# tmux -CC over a Rex session, so wezterm gets real tabs and splits
+# no zoom, wezterm ignores the layout's flags and drops the panes a zoomed layout leaves out
+
+commands :: ["capture-pane", "detach-client", "list-commands", "list-panes", "list-sessions", "list-windows", "new-window",
+	"refresh-client", "resize-pane", "resize-window", "select-pane", "select-window", "send-keys", "split-window"]
+
+pub run :: fn(sock, label: string) ! {
+	conn := rex.connect(sock)?
+	defer conn.close()
+	sessions :: conn.call[Sessions]("session.list")?.sessions
+	sid := (sessions.find({ $.label == label }) or rex.Session.{}).session_id
+	if sid == "" {
+		wins: json.Arr = [["layout" = rex.shell(os.cwd())]]
+		sid = conn.call[Created]("session.create", ["label" = label, "initial_windows" = wins])?.session_id
+	}
+	att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
+	view := att.view
+	if (view.windows or []).len() == 0 {
+		discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
+		view = conn.call[View]("session.view", ["session_id" = sid])?
+	}
+	term :: tty.raw(0)? # no echo, as with -CC
+	size :: tty.size(1)?
+	client := Cc.{
+		conn = conn, sid = sid, label = label, chunks = sync.Chan[rex.Chunk].{},
+		cols = int.(size.cols), rows = int.(size.rows),
+	}
+	out("\eP1000p")
+	client.reply("")
+	client.apply(view, false)?
+	out("%session-changed $" + client.num(sid).str() + " {label}\n")
+	why := ""
+	client.pump(tty.input(0)) or {
+		why = $.message()
+		()
+	}
+	client.close()
+	conn = client.conn # may have reconnected
+	discard conn.call[Ok]("session.detach", ["session_id" = sid]) or Ok.{}
+	out("%exit" + (if why != "" do " " + why else do "") + "\n\e\\")
+	if why != "" do return error(why)
+}
+
+Win :: struct {
+	wid, name, focus: string
+	parent: string # the Rex window, for a float
+	bounds: []float
+	tree: Json
+	layout: string
+	bids: []string
+	rects: [][]float
+}
+
+Pane :: struct {
+	bid: string
+	id: int
+	stream: rex.Stream
+	strip: strip.Strip
+	got: string
+	read: int
+	ended: bool
+	term: ghostty.Term
+	painted: bool
+	live: bool
+	held: string # may be half a query
+}
+
+Pane :< {
+	feed :: fn(mut self; data: string) string {
+		buf := data
+		pre := ""
+		if !self.painted {
+			self.got += data
+			term, rest := ghostty.decode(self.got) or return ""
+			self.term = term
+			self.painted = true
+			buf = self.got[rest..]
+			self.got = ""
+			pre = self.screen()
+		}
+		vt :: self.strip.feed(buf)
+		at := 0
+		loop (i, msg) in self.strip.msgs {
+			self.term.write(vt[at..i])
+			at = i
+			event :: json.decode[Rex1](msg) or continue
+			if event.type == "resize" do self.term.resize(event.cols or 1, event.rows or 1)
+		}
+		self.strip.msgs = []
+		self.term.write(vt[at..])
+		if !self.live do return ""
+		clean, held :: strip_queries(self.held + vt)
+		self.held = held
+		pre + clean
+	}
+
+	screen :: fn(self) string {
+		if !self.painted do return ""
+		big :: 1 << 15
+		alt :: if self.term.mode(1049) do "\e[?1049h" else do "\e[?1049l"
+		drawn :: self.term.draw(0, 0, big, big, true)
+		cursor, _, _ := self.term.cursor(0, 0, big, big)
+		alt + "\e[0m\e[H\e[2J" + drawn + self.term.modes() + cursor + "\e]2;" + self.term.title() + "\e\\"
+	}
+
+	close :: fn(self) {
+		self.stream.close()
+		if self.painted do self.term.free()
+	}
+}
+
+Cc :: struct {
+	conn: rex.Rex
+	sid, label: string
+	active: string
+	ids: []string # Rex ids by tmux number
+	wins: []Win
+	panes: []Pane
+	chunks: sync.Chan[rex.Chunk]
+	streams: int
+	cols, rows: int
+	seq: int
+	revision: int
+	buf: string
+}
+
+Cc :< {
+	pump :: fn(mut self; input: sync.Chan[string]) ! {
+		loop {
+			self.serve(input) or {
+				if !self.conn.lost do return $
+				self.reconnect()?
+				continue
+			}
+			return ()
+		}
+	}
+
+	# tmux has no way to say reconnecting, so wezterm's commands just wait
+	reconnect :: fn(mut self) ! {
+		at :: time.Instant.now()
+		loop {
+			self.conn = self.conn.reconnect() or {
+				if at.elapsed() > 2.min() do return error("lost the server")
+				time.sleep(1.sec())
+				continue
+			}
+			break
+		}
+		if !self.conn.resumed do discard self.call[Attached]("session.attach")?
+		self.apply(self.call[View]("session.view")?)?
+		loop i in 0..self.panes.len() {
+			if self.panes[i].ended do self.revive(i)
+		}
+		# a new client owns nothing yet
+		if !self.conn.resumed do self.claim(loop pane in self.panes do pane.bid)?
+	}
+
+	serve :: fn(mut self; input: sync.Chan[string]) ! {
+		loop {
+			loop {
+				event :: self.conn.queued() or break
+				if self.event(event)? do return ()
+			}
+			sync.select! {
+				got := <-input => {
+					self.buf += got or return ()
+					lines :: self.buf.split("\n")
+					self.buf = lines.last() or ""
+					loop line in lines[..(lines.len() - 1)] {
+						if !self.answer(line.trim())? do return ()
+					}
+				},
+				msg := <-self.conn.inbox => self.conn.take(msg)?,
+				chunk := <-self.chunks => {
+					self.data(chunk or return ())
+					loop 0..64 do self.data(self.chunks.try_recv() or break)
+				},
+			}
+		}
+	}
+
+	answer :: fn(mut self; line: string) !bool {
+		argv :: words(line)
+		if argv.len() == 0 do return false
+		hits :: commands.filter({ $.starts_with(argv[0]) })
+		cmd :: if hits.len() == 1 do hits[0] else do argv[0]
+		if cmd == "detach-client" do return false
+		was: []bool = loop pane in self.panes do pane.live
+		body :: self.command(cmd, argv[1..]) or {
+			self.reply($.message(), true)
+			return true
+		}
+		self.reply(body)
+		loop i in 0..self.panes.len() {
+			if self.panes[i].live && !was[i] do self.output(i, self.panes[i].screen())
+		}
+		true
+	}
+
+	reply :: fn(mut self; body: string, bad := false) {
+		self.seq += 1
+		tag :: " 0 {self.seq} 1\n"
+		out("%begin" + tag + (if body != "" do body + "\n" else do "") + (if bad do "%error" else do "%end") + tag)
+	}
+
+	command :: fn(mut self; cmd: string, args: []string) !string {
+		target :: self.target(args)
+		match cmd {
+			"list-commands" => commands.join("\n"),
+			"list-sessions" => "{self.label}: {self.wins.len()} windows",
+			"list-windows" => {
+				format :: opt(args, "-F") or "#{{window_index}}: #{{window_name}} [#{{window_width}}x#{{window_height}}] #{{window_layout}}"
+				(loop i in 0..self.wins.len() do expand(format, self.window_vars(i))).join("\n")
+			},
+			"list-panes" => {
+				format :: opt(args, "-F") or "#{{pane_index}}: [#{{pane_width}}x#{{pane_height}}] #{{pane_id}}"
+				wid :: if target == "" do self.active else do target
+				win :: self.wins.find({ $.wid == wid }) or return error("can't find window: {wid}")
+				lines := []string.{}
+				loop i in 0..win.bids.len() {
+					lines << expand(format, self.pane_vars(win, i))
+					at :: self.at(win.bids[i])
+					if at >= 0 do self.panes[at].live = true
+				}
+				lines.join("\n")
+			},
+			"capture-pane" => "",
+			"send-keys" => {
+				bytes: []u8 = loop arg in args.filter({ $.starts_with("0x") }) do u8.(unhex(arg[2..]))
+				if bytes.len() > 0 do self.term(target, "write", ["data" = string.(bytes)])?
+				""
+			},
+			"resize-window" => {
+				self.cols = int.try_from(opt(args, "-x") or "")?
+				self.rows = int.try_from(opt(args, "-y") or "")?
+				""
+			},
+			"refresh-client" => {
+				size :: (opt(args, "-C") or "").replace(",", "x").split("x")
+				if size.len() == 2 {
+					self.cols = int.try_from(size[0])?
+					self.rows = int.try_from(size[1])?
+				}
+				""
+			},
+			"resize-pane" => {
+				self.ok("session.own_block", ["block_ids" = [Json.(target)]])?
+				cols, rows :: int.try_from(opt(args, "-x") or "")?, int.try_from(opt(args, "-y") or "")?
+				self.term(target, "resize", ["columns" = float.(cols), "rows" = float.(rows)])?
+				""
+			},
+			"split-window" => {
+				empty: Obj = []
+				proc :: self.call[Process]("com.superlogical.terminal.process", ["block_id" = target, "args" = empty]) or Process.{}
+				self.ok("session.new_split", ["anchor_id" = target, "direction" = if "-h" in args do "horizontal" else do "vertical",
+					"side" = "after", "layout" = rex.shell(rex.cwd(proc)), "focus" = true])?
+				""
+			},
+			"new-window" => {
+				self.ok("session.new_window", ["layout" = rex.shell(os.cwd())])?
+				""
+			},
+			"select-window" => {
+				win :: self.wins.find({ $.wid == target }) or return error("can't find window: {target}")
+				if win.parent == win.wid do self.ok("session.focus_window", ["window_id" = target])?
+				else do self.ok("session.focus_block", ["block_id" = if win.focus in win.bids do win.focus else do win.bids[0]])?
+				""
+			},
+			"select-pane" => {
+				self.ok("session.focus_block", ["block_id" = target])?
+				""
+			},
+			else => return error("unknown command: {cmd}"),
+		}
+	}
+
+	window_vars :: fn(mut self; i: int) [string]string {
+		win :: self.wins[i]
+		[
+			"session_id" = "$" + self.num(self.sid).str(), "session_name" = self.label,
+			"window_id" = "@" + self.num(win.wid).str(), "window_index" = i.str(),
+			# wezterm splits the line on spaces
+			"window_name" = win.name.replace(" ", "_"),
+			"window_active" = if win.wid == self.active do "1" else do "0",
+			"window_width" = self.cols.str(), "window_height" = self.rows.str(),
+			"window_layout" = csum(self.layout(win.tree, win.bounds)), "history_limit" = "0",
+		]
+	}
+
+	pane_vars :: fn(mut self; win: Win, i: int) [string]string {
+		x, y, pw, ph :: rex.grid(win.rects[i], win.bounds, self.cols, self.rows)
+		[
+			"session_id" = "$" + self.num(self.sid).str(), "window_id" = "@" + self.num(win.wid).str(),
+			"pane_id" = "%" + self.num(win.bids[i]).str(), "pane_index" = i.str(), "cursor_x" = "0", "cursor_y" = "0",
+			"pane_width" = pw.str(), "pane_height" = ph.str(), "pane_left" = x.str(), "pane_top" = y.str(),
+			"pane_active" = if win.bids[i] == win.focus do "1" else do "0",
+		]
+	}
+
+	layout :: fn(mut self; tree: Json, bounds: []float) string {
+		node :: json.from_json[Node](tree) or return ""
+		x, y, w, h :: rex.grid(node.rect, bounds, self.cols, self.rows)
+		at :: "{w}x{h},{x},{y}"
+		if bid := node.block_id do return at + "," + self.num(bid).str()
+		split :: node.split or return at
+		kids: []string = loop kid in row(tree, split.direction) do self.layout(kid, bounds)
+		if split.direction == "horizontal" {
+			at + "{{" + kids.join(",") + "}}"
+		} else {
+			at + "[" + kids.join(",") + "]"
+		}
+	}
+
+	num :: fn(mut self; id: string) int {
+		if i := self.ids.index(id) do return i
+		self.ids << id
+		self.ids.len() - 1
+	}
+
+	target :: fn(self; args: []string) string {
+		target :: opt(args, "-t") or return ""
+		num :: int.try_from(target[1..]) or return ""
+		if num < self.ids.len() do self.ids[num] else do ""
+	}
+
+	apply :: fn(mut self; view: View, tell := true) ! {
+		self.revision = view.revision
+		self.active = view.active_window_id or ""
+		wins := []Win.{}
+		loop window in view.windows or []; layer in window.layers {
+			tree :: layer.layout or continue
+			if (layer.state or "") == "minimized" do continue
+			tiled :: layer.kind == "tiled"
+			label :: window.label or ""
+			# skip Rex's default label so wezterm shows the pane's title
+			default :: label.starts_with("Window ") && window.window_id.ends_with(label[7..])
+			name :: if !tiled || default do "" else do label
+			leafs :: rex.leaves(tree)
+			win :: Win.{
+				wid = if tiled do window.window_id else do layer.layer_id or "",
+				parent = window.window_id, name = name, focus = window.focused_block_id or "",
+				bounds = layer.bounds, tree = tree, layout = self.layout(tree, layer.bounds),
+				bids = leafs.map({ $.bid }), rects = leafs.map({ $.rect }),
+			}
+			if !tiled && window.window_id == self.active && win.focus in win.bids do self.active = win.wid
+			wins << win
+		}
+		kept := []Pane.{}
+		fresh := []string.{}
+		loop win in wins; bid in win.bids {
+			if pane := self.take(bid) {
+				kept << pane
+				continue
+			}
+			pane :: self.open(bid) or continue
+			kept << pane
+			fresh << bid
+		}
+		loop pane in self.panes do pane.close()
+		self.panes = kept
+		if tell do self.tell(wins)
+		self.wins = wins
+		if fresh.len() > 0 do self.claim(fresh)?
+	}
+
+	claim :: fn(mut self; bids: []string) ! {
+		ids: []Json = loop bid in bids do Json.(bid)
+		self.ok("session.own_block", ["block_ids" = ids])?
+		loop win in self.wins; bid, i in win.bids {
+			if bid !in bids do continue
+			_, _, cw, ch := rex.grid(win.rects[i], win.bounds, self.cols, self.rows)
+			self.term(bid, "resize", ["columns" = float.(cw), "rows" = float.(ch)])?
+		}
+	}
+
+	tell :: fn(mut self; wins: []Win) {
+		loop old in self.wins {
+			if !wins.any({ $.wid == old.wid }) do out("%window-close @{self.num(old.wid)}\n")
+		}
+		loop win in wins {
+			id :: self.num(win.wid)
+			old :: self.wins.find({ $.wid == win.wid }) or {
+				out("%window-add @{id}\n")
+				continue
+			}
+			if win.name != old.name do out("%window-renamed @{id} {win.name}\n")
+			# before the layout, wezterm pairs a new pane with the split it asked for
+			loop bid in win.bids {
+				if bid !in old.bids do out("%window-pane-changed @{id} %{self.num(bid)}\n")
+			}
+			if win.layout != old.layout {
+				out("%layout-change @{id} {csum(win.layout)} {csum(win.layout)} *\n")
+			}
+		}
+	}
+
+	event :: fn(mut self; raw: Json) !bool {
+		outer :: json.from_json[Outer](raw) or return false
+		if outer.type == "session_destroyed" do return true
+		ev :: outer.payload.event or return false
+		if ev.type != "session_view_changed" || (ev.payload.revision or 0) <= self.revision {
+			return false
+		}
+		view :: self.call[View]("session.view") or return false
+		self.apply(view)?
+		# Rex keeps an empty session, tmux doesn't
+		if (view.windows or []).len() > 0 do return false
+		discard self.call[Ok]("session.destroy") or Ok.{}
+		true
+	}
+
+	data :: fn(mut self; chunk: rex.Chunk) {
+		i :: self.find(chunk.id)
+		if i < 0 do return
+		data :: chunk.data or {
+			self.revive(i)
+			return
+		}
+		self.panes[i].read += data.len()
+		self.output(i, self.panes[i].feed(data))
+	}
+
+	output :: fn(mut self; i: int, vt: string) {
+		if vt != "" do out("%output %" + self.num(self.panes[i].bid).str() + " " + vis(vt) + "\n")
+	}
+
+	revive :: fn(mut self; i: int) {
+		pane :: self.panes[i]
+		stream :: pane.stream.resume(pane.read) or {
+			self.panes[i].ended = true
+			if !pane.painted do return
+			fresh := self.open(pane.bid) or return
+			fresh.live = pane.live
+			pane.close()
+			self.panes[i] = fresh
+			return
+		}
+		self.panes[i].stream = stream
+		self.panes[i].ended = false
+	}
+
+	open :: fn(mut self; bid: string) !Pane {
+		self.streams += 1
+		stream :: self.conn.data(self.sid, bid, self.streams, self.chunks)?
+		Pane.{ bid = bid, id = self.streams, stream = stream, strip = strip.Strip.new(stream.nonce) }
+	}
+
+	take :: fn(mut self; bid: string) ?Pane {
+		i :: self.at(bid)
+		if i < 0 do return none
+		pane :: self.panes[i]
+		rest := self.panes[..i]
+		rest << self.panes[(i + 1)..]
+		self.panes = rest
+		pane
+	}
+
+	at :: fn(self; bid: string) int {
+		loop pane, i in self.panes {
+			if pane.bid == bid do return i
+		}
+		return -1
+	}
+
+	find :: fn(self; id: int) int {
+		loop pane, i in self.panes {
+			if pane.id == id do return i
+		}
+		return -1
+	}
+
+	close :: fn(mut self) {
+		loop pane in self.panes do pane.close()
+		self.panes = []
+		self.chunks.close()
+	}
+
+	term :: fn(mut self; bid, method: string, args: Obj) ! {
+		self.ok("com.superlogical.terminal." + method, ["block_id" = bid, "args" = args])?
+	}
+
+	ok :: fn(mut self; method: string, payload: Obj = []) ! {
+		discard self.call[Ok](method, payload)?
+	}
+
+	call[T] :: fn(mut self; method: string, payload: Obj = []) !T {
+		body := payload
+		body["session_id"] = self.sid
+		self.conn.call[T](method, body)
+	}
+}
+
+row :: fn(tree: Json, direction: string) []Json {
+	node :: json.from_json[Node](tree) or return [tree]
+	split :: node.split or return [tree]
+	if split.direction != direction do return [tree]
+	[..row(split.before, direction), ..row(split.after, direction)]
+}
+
+csum :: fn(layout: string) string {
+	sum := 0
+	loop byte in []u8.(layout) do sum = ((sum >> 1) + ((sum & 1) << 15) + int.(byte)) & 0xffff
+	digits :: "0123456789abcdef"
+	hex: []string = loop shift in [12, 8, 4, 0] do digits[((sum >> shift) & 15)..(((sum >> shift) & 15) + 1)]
+	hex.join("") + "," + layout
+}
+
+# octal like tmux's %output, so it stays one line
+vis :: fn(text: string) string {
+	buf := Buffer.{}
+	at := 0
+	loop i in 0..text.len() {
+		byte :: int.(text[i])
+		if byte >= 32 && byte != 92 do continue
+		buf.write(text[at..i])
+		buf.write("\\{byte >> 6}{(byte >> 3) & 7}{byte & 7}")
+		at = i + 1
+	}
+	buf.write(text[at..])
+	buf.str()
+}
+
+# Rex answers queries itself, wezterm's answers would show up as typing
+strip_queries :: fn(vt: string) (clean, held: string) {
+	buf := Buffer.{}
+	at, i := 0, 0
+	loop i < vt.len() {
+		len :: query_len(vt[i..])
+		if len < 0 {
+			buf.write(vt[at..i])
+			return (buf.str(), vt[i..])
+		}
+		if len == 0 {
+			i += 1
+			continue
+		}
+		buf.write(vt[at..i])
+		i += len
+		at = i
+	}
+	if at == 0 do return (vt, "")
+	buf.write(vt[at..])
+	(buf.str(), "")
+}
+
+query_len :: fn(seq: string) int {
+	if seq == "\e" do return -1
+	if seq.len() < 2 || seq[0] != '\e' do return 0
+	cut :: seq.len() < 64 # queries are short
+	params, fin, len := keys.csi(seq)
+	if seq[1] == '[' && len == 0 {
+		loop byte in []u8.(seq[2..]) {
+			if byte < ' ' || byte > '?' do return 0
+		}
+		return if cut do -1 else do 0
+	}
+	if len > 0 {
+		# status, attributes, mode, version, kitty flags and size reports
+		asks :: fin == 'n' && !params.starts_with(">") || fin == 'c' || fin == 'p' && params.ends_with("$") || fin == 'q' && params.starts_with(">") ||
+			fin == 'u' && params == "?" || fin == 't' && params.split(";")[0] in ["11", "13", "14", "15", "16", "18", "19", "20", "21"]
+		return if asks do len else do 0
+	}
+	if seq[1] != ']' && seq[1] != 'P' do return 0
+	loop i in 2..seq.len() {
+		bel :: seq[i] == 7
+		if !bel && !(seq[i] == '\e' && i + 1 < seq.len() && seq[i + 1] == '\\') do continue
+		body :: seq[2..i]
+		# DECRQSS and XTGETTCAP, or an OSC color or clipboard query
+		asks :: if seq[1] == 'P' do body.starts_with("$q") || body.starts_with("+q") else do body.ends_with(";?")
+		return if !asks do 0 else if bel do i + 1 else do i + 2
+	}
+	if cut do -1 else do 0
+}
+
+words :: fn(line: string) []string {
+	out := []string.{}
+	word := ""
+	quoted, has := false, false
+	loop char in line {
+		if char == '\'' {
+			quoted = !quoted
+			has = true
+			continue
+		}
+		if char == ' ' && !quoted {
+			if has do out << word
+			word = ""
+			has = false
+			continue
+		}
+		word += char.str()
+		has = true
+	}
+	if has do out << word
+	out
+}
+
+opt :: fn(args: []string, flag: string) ?string {
+	loop i in 0..(args.len() - 1) {
+		if args[i] == flag do return args[i + 1]
+	}
+	none
+}
+
+unhex :: fn(hex: string) int {
+	value := 0
+	loop byte in []u8.(hex.lower()) {
+		digit :: int.(byte)
+		value = value * 16 + if digit <= 57 do digit - 48 else do digit - 87
+	}
+	value
+}
+
+expand :: fn(format: string, vars: [string]string) string {
+	parts :: format.split("#{{")
+	text := parts[0]
+	loop part in parts[1..] {
+		end :: part.split("}}")
+		text += (vars[end[0]] or "") + end[1..].join("}}")
+	}
+	text
+}
+
+pub out :: fn(text: string) {
+	at := 0
+	loop at < text.len() {
+		wrote :: unsafe libc.write(1, text.ptr.offset(at), usize.(text.len() - at))
+		if wrote <= 0 do return
+		at += int.(wrote)
+	}
+}

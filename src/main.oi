@@ -10,6 +10,8 @@ use math.{ min, max, clamp }
 use json.{ Json, Obj }
 use rex
 use rex.{ Sessions, Session, View, Window, Layer, Node, Split, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
+use cc
+use cc.{ out }
 use strip
 use keys
 use keymap
@@ -74,6 +76,7 @@ cli :: fn(args: []string) ! {
 		"kill" => proxy(sock, "kill", args[1..]),
 		"rename" => proxy(sock, "session rename", args[1..]),
 		"dump" => return dump(sock, named(args[1..])),
+		"-CC" => return cc.run(sock, named(args[1..])),
 		"help", "-h", "--help" => {
 			print(usage)
 			return ()
@@ -139,6 +142,7 @@ commands:
   w, warp name         create/join session after warping to the given dir (needs zoxide)
   run [name] -- cmd    create session running cmd instead of a shell, no status line, like abduco
   dump [name]          print a session as a layout file, for -l
+  -CC [name]           tmux control mode for wezterm, like tmux -CC
   ls [-j, --json]      list sessions
   rename [session] name
                        rename a session, the current one by default
@@ -278,15 +282,6 @@ autostart :: fn(sock: string) {
 }
 
 quote :: fn(text: string) string { "'" + text.replace("'", "'\\''") + "'" }
-
-out :: fn(text: string) {
-	at := 0
-	loop at < text.len() {
-		wrote :: unsafe libc.write(1, text.ptr.offset(at), usize.(text.len() - at))
-		if wrote <= 0 do return
-		at += int.(wrote)
-	}
-}
 
 popen : fn(cmd: cstr, mode: cstr) ptr : foreign
 pclose : fn(f: ptr) i32 : foreign

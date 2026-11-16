@@ -1,0 +1,9 @@
+test! "cc" {
+	assert! csum("159x48,0,0{{79x48,0,0,79x48,80,0}}") == "bb62,159x48,0,0{{79x48,0,0,79x48,80,0}}"
+	assert! vis("a\e[1m\\\r\n") == "a\\033[1m\\134\\015\\012"
+	assert! words("list-panes -F '#{{pane_id}} #{{pane_index}}' -t @1") == ["list-panes", "-F", "#{{pane_id}} #{{pane_index}}", "-t", "@1"]
+	assert! expand("#{{a}} x #{{b}}#{{c}}", ["a" = "1", "b" = "2"]) == "1 x 2"
+	assert! strip_queries("a\e[6nb\e[1mc\e]11;?\e\\d\e[?2026$pe\e]133;A\e\\f\e[>c").0 == "ab\e[1mcde\e]133;A\e\\f"
+	assert! strip_queries("a\e[6") == ("a", "\e[6") && strip_queries("a\e]11;?\e") == ("a", "\e]11;?\e") && strip_queries("a\e") == ("a", "\e")
+	assert! strip_queries("a\e[\x01b") == ("a\e[\x01b", "")
+}
