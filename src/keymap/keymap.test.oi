@@ -29,6 +29,8 @@ test! "find" {
 test! "which-key rows" {
 	km :: json.decode[Keymap](r"""{"config": {"hash": ""}, "bindings": [
 		{"keys": ["v", "x"], "action": "pane.close"},
+		{"keys": ["v", "r"], "action": "client.mode.enter", "args": {"name": "resize"}},
+		{"keys": ["w", "t"], "action": "tab.layout", "args": {"layout": "tiled"}},
 		{"keys": ["right"], "action": "pane.focus", "args": {"direction": "right"}},
 		{"keys": ["l"], "action": "pane.focus", "args": {"direction": "right"}},
 		{"keys": ["shift+l"], "action": "pane.resize", "args": {"direction": "right", "cells": 5}},
@@ -37,7 +39,9 @@ test! "which-key rows" {
 		{"keys": ["shift+h"], "action": "pane.resize", "args": {"direction": "left", "cells": 5}},
 		{"keys": ["n"], "action": "tab.new", "args": {"side": "after"}}
 	]}""") or panic!($.message())
-	titles: [string]string = ["pane.focus" = "Focus Pane", "pane.resize" = "Resize Pane"]
-	got :: (loop (keys, title) in hint_rows(km.bindings, 0, titles) do "{keys}={title}").join(", ")
-	assert! got == "n=tab.new after, shift+h/l=Resize Pane, h/l=Focus Pane, left/right=Focus Pane, v=…"
+
+	titles: [string]string = ["pane.focus" = "focus pane", "pane.resize" = "resize pane"]
+	rows, groups :: hint_rows(km.bindings, 0, titles)
+	got :: (loop (keys, title) in rows do "{keys}={title}").join(", ")
+	assert! got == "w=tab.layout…, v=pane…, n=tab.new after, shift+h/l=resize pane, h/l=focus pane, left/right=focus pane" && groups == 2
 }

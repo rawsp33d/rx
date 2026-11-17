@@ -1,84 +1,84 @@
 use json
-use json.{ Json, Obj }
+use math
 
 # rx's own actions. binds no keys, init.lua does
 pub REQUEST :: r"""{
 	"actions": [
 		{"name": "detach", "kind": "client", "title": "Detach"},
-		{"name": "session.choose", "kind": "client", "title": "Choose Session"},
-		{"name": "session.new", "kind": "client", "title": "New Session"},
-		{"name": "session.warp", "kind": "client", "title": "Warp to Session"},
-		{"name": "session.rename", "kind": "client", "title": "Rename Session"},
-		{"name": "session.close", "kind": "client", "title": "Close Session"},
-		{"name": "session.next", "kind": "client", "title": "Next Session"},
-		{"name": "session.last", "kind": "client", "title": "Last Session"},
-		{"name": "session.previous", "kind": "client", "title": "Previous Session"},
-		{"name": "session.select", "kind": "client", "title": "Select Session", "args": {"type": "object", "properties": {"session_id": {"type": "string"}, "window_id": {"type": "string"}}, "required": ["session_id"]}},
-		{"name": "pane.split", "kind": "client", "title": "Split Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
-		{"name": "pane.break", "kind": "client", "title": "Break Pane to Tab"},
-		{"name": "pane.mark", "kind": "client", "title": "Mark Pane"},
-		{"name": "pane.join", "kind": "client", "title": "Join Marked Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
-		{"name": "pane.rotate", "kind": "client", "title": "Rotate Panes", "args": {"type": "object", "properties": {"direction": {"enum": ["down", "up"]}}}},
-		{"name": "pane.edit", "kind": "client", "title": "Edit Scrollback"},
-		{"name": "pane.close", "kind": "client", "title": "Close Pane"},
-		{"name": "pane.zoom", "kind": "client", "title": "Zoom Pane"},
-		{"name": "pane.focus", "kind": "client", "title": "Focus Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
-		{"name": "pane.resize", "kind": "client", "title": "Resize Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
-		{"name": "pane.next", "kind": "client", "title": "Next Pane"},
-		{"name": "pane.last", "kind": "client", "title": "Last Pane"},
-		{"name": "pane.attention", "kind": "client", "title": "Next Waiting Program"},
-		{"name": "layer.float", "kind": "client", "title": "Toggle Floating"},
-		{"name": "pane.copy", "kind": "client", "title": "Copy Mode"},
-		{"name": "pane.paste", "kind": "client", "title": "Paste Last Copy"},
-		{"name": "pane.choose", "kind": "client", "title": "Choose Pane by Number"},
-		{"name": "pane.clock", "kind": "client", "title": "Show a Clock"},
-		{"name": "pane.find", "kind": "client", "title": "Find in Any Pane"},
-		{"name": "pane.hints", "kind": "client", "title": "Copy Text by Hint"},
-		{"name": "client.palette", "kind": "client", "title": "Command Palette"},
-		{"name": "client.prompt", "kind": "client", "title": "Command Prompt"},
-		{"name": "buffer.choose", "kind": "client", "title": "Paste an Earlier Copy"},
-		{"name": "client.choose", "kind": "client", "title": "Detach a Client"},
-		{"name": "client.detach_others", "kind": "client", "title": "Detach Other Clients"},
-		{"name": "client.config.reload", "kind": "client", "title": "Reload Config"},
-		{"name": "mouse.toggle", "kind": "client", "title": "Toggle Mouse"},
-		{"name": "pane.titles", "kind": "client", "title": "Toggle Pane Titles"},
-		{"name": "pane.dim", "kind": "client", "title": "Dim Unfocused Panes"},
-		{"name": "macro.record", "kind": "client", "title": "Record Macro"},
-		{"name": "macro.play", "kind": "client", "title": "Play Macro"},
-		{"name": "layer.new", "kind": "client", "title": "New Layer", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
-		{"name": "pane.pipe", "kind": "client", "title": "Pipe Output", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
-		{"name": "pane.run", "kind": "client", "title": "Run Command", "args": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-		{"name": "layer.move", "kind": "client", "title": "Move Layer", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
-		{"name": "pane.swap", "kind": "client", "title": "Swap Pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
-		{"name": "layer.raise", "kind": "client", "title": "Raise Layer"},
-		{"name": "layer.lower", "kind": "client", "title": "Lower Layer"},
-		{"name": "layer.minimize", "kind": "client", "title": "Minimize Layer"},
-		{"name": "layer.restore", "kind": "client", "title": "Restore Minimized Layer"},
-		{"name": "layer.close", "kind": "client", "title": "Close Layer"},
-		{"name": "layer.toggle_all", "kind": "client", "title": "Toggle Layers"},
-		{"name": "tab.new", "kind": "client", "title": "New Tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
-		{"name": "tab.next", "kind": "client", "title": "Next Tab"},
-		{"name": "tab.previous", "kind": "client", "title": "Previous Tab"},
-		{"name": "tab.last", "kind": "client", "title": "Last Tab"},
-		{"name": "client.tab.goto", "kind": "client", "title": "Go to Tab", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
-		{"name": "tab.move", "kind": "client", "title": "Move Tab", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "left"]}}}},
-		{"name": "tab.close", "kind": "client", "title": "Close Tab"},
-		{"name": "tab.even", "kind": "client", "title": "Even Out Panes"},
-		{"name": "tab.sync", "kind": "client", "title": "Synchronize Panes"},
-		{"name": "pane.group", "kind": "client", "title": "Toggle Typing Group"},
-		{"name": "tab.rename", "kind": "client", "title": "Rename Tab"},
-		{"name": "tab.choose", "kind": "client", "title": "Choose Tab in Any Session"},
-		{"name": "tab.layout", "kind": "client", "title": "Lay Out Tab", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled", "next", "previous"]}}}},
-		{"name": "tab.tile", "kind": "client", "title": "Auto Tile", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]}}}},
-		{"name": "client.mode.enter", "kind": "client", "title": "Enter Mode", "args": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-		{"name": "client.mode.exit", "kind": "client", "title": "Exit Mode"},
-		{"name": "client.mode.exit_all", "kind": "client", "title": "Exit All Modes"}
+		{"name": "session.choose", "kind": "client", "title": "choose session"},
+		{"name": "session.new", "kind": "client", "title": "new session"},
+		{"name": "session.warp", "kind": "client", "title": "warp to session"},
+		{"name": "session.rename", "kind": "client", "title": "rename session"},
+		{"name": "session.close", "kind": "client", "title": "close session"},
+		{"name": "session.next", "kind": "client", "title": "next session"},
+		{"name": "session.last", "kind": "client", "title": "last session"},
+		{"name": "session.previous", "kind": "client", "title": "previous session"},
+		{"name": "session.select", "kind": "client", "title": "select session", "args": {"type": "object", "properties": {"session_id": {"type": "string"}, "window_id": {"type": "string"}}, "required": ["session_id"]}},
+		{"name": "pane.split", "kind": "client", "title": "split pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
+		{"name": "pane.break", "kind": "client", "title": "break pane to tab"},
+		{"name": "pane.mark", "kind": "client", "title": "mark pane"},
+		{"name": "pane.join", "kind": "client", "title": "join marked pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
+		{"name": "pane.rotate", "kind": "client", "title": "rotate panes", "args": {"type": "object", "properties": {"direction": {"enum": ["down", "up"]}}}},
+		{"name": "pane.edit", "kind": "client", "title": "edit scrollback"},
+		{"name": "pane.close", "kind": "client", "title": "close pane"},
+		{"name": "pane.zoom", "kind": "client", "title": "zoom pane"},
+		{"name": "pane.focus", "kind": "client", "title": "focus pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
+		{"name": "pane.resize", "kind": "client", "title": "resize pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
+		{"name": "pane.next", "kind": "client", "title": "next pane"},
+		{"name": "pane.last", "kind": "client", "title": "last pane"},
+		{"name": "pane.attention", "kind": "client", "title": "next waiting program"},
+		{"name": "layer.float", "kind": "client", "title": "toggle floating"},
+		{"name": "pane.copy", "kind": "client", "title": "copy mode"},
+		{"name": "pane.paste", "kind": "client", "title": "paste last copy"},
+		{"name": "pane.choose", "kind": "client", "title": "choose pane by number"},
+		{"name": "pane.clock", "kind": "client", "title": "show a clock"},
+		{"name": "pane.find", "kind": "client", "title": "find in any pane"},
+		{"name": "pane.hints", "kind": "client", "title": "copy text by hint"},
+		{"name": "client.palette", "kind": "client", "title": "command palette"},
+		{"name": "client.prompt", "kind": "client", "title": "command prompt"},
+		{"name": "buffer.choose", "kind": "client", "title": "paste an earlier copy"},
+		{"name": "client.choose", "kind": "client", "title": "detach a client"},
+		{"name": "client.detach_others", "kind": "client", "title": "detach other clients"},
+		{"name": "client.config.reload", "kind": "client", "title": "reload config"},
+		{"name": "mouse.toggle", "kind": "client", "title": "toggle mouse"},
+		{"name": "pane.titles", "kind": "client", "title": "toggle pane titles"},
+		{"name": "pane.dim", "kind": "client", "title": "dim unfocused panes"},
+		{"name": "macro.record", "kind": "client", "title": "record macro"},
+		{"name": "macro.play", "kind": "client", "title": "play macro"},
+		{"name": "layer.new", "kind": "client", "title": "file", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
+		{"name": "pane.pipe", "kind": "client", "title": "pipe output", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
+		{"name": "pane.run", "kind": "client", "title": "run command", "args": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+		{"name": "layer.move", "kind": "client", "title": "move layer", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
+		{"name": "pane.swap", "kind": "client", "title": "swap pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
+		{"name": "layer.raise", "kind": "client", "title": "raise layer"},
+		{"name": "layer.lower", "kind": "client", "title": "lower layer"},
+		{"name": "layer.minimize", "kind": "client", "title": "minimize layer"},
+		{"name": "layer.restore", "kind": "client", "title": "restore minimized layer"},
+		{"name": "layer.close", "kind": "client", "title": "close layer"},
+		{"name": "layer.toggle_all", "kind": "client", "title": "toggle layers"},
+		{"name": "tab.new", "kind": "client", "title": "new tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
+		{"name": "tab.next", "kind": "client", "title": "next tab"},
+		{"name": "tab.previous", "kind": "client", "title": "previous tab"},
+		{"name": "tab.last", "kind": "client", "title": "last tab"},
+		{"name": "client.tab.goto", "kind": "client", "title": "go to tab", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
+		{"name": "tab.move", "kind": "client", "title": "move tab", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "left"]}}}},
+		{"name": "tab.close", "kind": "client", "title": "close tab"},
+		{"name": "tab.even", "kind": "client", "title": "even out panes"},
+		{"name": "tab.sync", "kind": "client", "title": "synchronize panes"},
+		{"name": "pane.group", "kind": "client", "title": "toggle typing group"},
+		{"name": "tab.rename", "kind": "client", "title": "rename tab"},
+		{"name": "tab.choose", "kind": "client", "title": "choose tab in any session"},
+		{"name": "tab.layout", "kind": "client", "title": "layout", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled", "next", "previous"]}}}},
+		{"name": "tab.tile", "kind": "client", "title": "auto tile", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]}}}},
+		{"name": "client.mode.enter", "kind": "client", "title": "enter mode", "args": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+		{"name": "client.mode.exit", "kind": "client", "title": "exit mode"},
+		{"name": "client.mode.exit_all", "kind": "client", "title": "exit all modes"}
 	]
 }"""
 
-pub Binding :: struct { pub keys: []string, pub action: string, pub args: ?Json, pub mode: ?string }
+pub Binding :: struct { pub keys: []string, pub action: string, pub args: ?json.Json, pub mode: ?string }
 pub Action :: struct { pub name: string, pub title: ?string, pub args: ?Schema }
-pub Schema :: struct { pub required: ?[]string, pub properties: ?Json }
+pub Schema :: struct { pub required: ?[]string, pub properties: ?json.Json }
 pub Config :: struct { pub hash: string }
 pub Mode :: struct { pub name: string, pub exclusive: bool, pub blocked: ?[][]string }
 
@@ -88,7 +88,7 @@ pub Keymap :: struct { pub bindings: []Binding, pub actions: ?[]Action, pub mode
 
 Request :: struct { pub actions: []Action }
 
-pub request :: fn() !Obj {
+pub request :: fn() !json.Obj {
 	json.parse(REQUEST)? |> obj
 }
 
@@ -107,8 +107,18 @@ pub arg_words :: fn(action: Action) []string {
 	out
 }
 
-obj :: fn(value: Json) Obj { match value { is Obj => value, _ => [] } }
-arr :: fn(value: Json) json.Arr { match value { is json.Arr => value, _ => [] } }
+obj :: fn(value: json.Json) json.Obj {
+	match value {
+		is json.Obj => value,
+		_ => []
+	}
+}
+arr :: fn(value: json.Json) json.Arr {
+	match value {
+		is json.Arr => value,
+		_ => []
+	}
+}
 
 pub declared :: fn() ![]Action {
 	json.decode[Request](REQUEST)?.actions
@@ -154,16 +164,25 @@ pub matches :: fn(keys: []string, typed: [][]string) bool {
 	true
 }
 
-# an action's keys for each direction share a row, like h/l
-pub hint_rows :: fn(bindings: []Binding, depth: int, titles: [string]string) [](string, string) {
-	empty: Obj = []
+## An action's keys for each direction share a row, like h/l. Submenus sorted first.
+pub hint_rows :: fn(bindings: []Binding, depth: int, titles: [string]string) (rows: [](string, string), groups: int) {
+	empty: json.Obj = []
+	subs := [](string, string).{}
 	keys, labels, bases, dirs := [][]string.{}, []string.{}, []string.{}, []string.{}
 	loop i in 0..bindings.len() {
-		binding :: bindings[bindings.len() - 1 - i]
+		earlier :: bindings[..(bindings.len() - 1 - i)]
+		binding :: bindings[earlier.len()]
 		key :: binding.keys[depth]
-		more :: binding.keys.len() > depth + 1
+		if earlier.any({ $.keys[depth] == key }) do continue
+
+		if binding.keys.len() > depth + 1 {
+			under :: bindings.filter({ $.keys.len() > depth + 1 && $.keys[depth] == key })
+			subs << (key, group(under.map({ $.action }), titles) + "…")
+			continue
+		}
+
 		args :: json.from_json[Args](binding.args or { empty }) or Args.{}
-		dir :: if more do "" else do (args.direction or "") + " "
+		dir :: (args.direction or "") + " "
 		base :: "{binding.action} {args.cells or 0} " + title_of(binding, titles, false)
 		at := -1
 		if dir != " " {
@@ -171,6 +190,7 @@ pub hint_rows :: fn(bindings: []Binding, depth: int, titles: [string]string) [](
 				if at < 0 && bases[j] == base && !dirs[j].contains(dir) do at = j
 			}
 		}
+
 		if at >= 0 {
 			row := keys[at]
 			row << key
@@ -179,12 +199,32 @@ pub hint_rows :: fn(bindings: []Binding, depth: int, titles: [string]string) [](
 			dirs[at] += dir
 			continue
 		}
+
 		keys << [key]
-		labels << if more do "…" else do title_of(binding, titles)
+		labels << title_of(binding, titles)
 		bases << if dir != " " do base else do ""
 		dirs << dir
 	}
-	loop i in 0..keys.len() do (keys_of(keys[i]), labels[i])
+	rows = [
+		..subs,
+		..(loop i in 0..keys.len() { (keys_of(keys[i]), labels[i]) }),
+	]
+	return (rows, subs.len())
+}
+
+group :: fn(actions: []string, titles: [string]string) (name: string) {
+	if !actions.any({ $ != actions[0] }) do return titles[actions[0]] or { actions[0] }
+
+	spaces :: loop action in actions {
+		parts :: action.split(".")
+		parts[math.max(parts.len() - 2, 0)]
+	}
+	loop space in spaces {
+		if spaces.filter({ $ == space }).len() > spaces.filter({ $ == name }).len() {
+			name = space
+		}
+	}
+	return
 }
 
 keys_of :: fn(keys: []string) string {
@@ -200,7 +240,7 @@ mods :: fn(key: string) string {
 }
 
 title_of :: fn(binding: Binding, titles: [string]string, dir := true) string {
-	empty: Obj = []
+	empty: json.Obj = []
 	args :: json.from_json[Args](binding.args or { empty }) or Args.{}
 	detail := args.command or args.layout or args.side or args.name or ""
 	if dir do detail = args.direction or { detail }

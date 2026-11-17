@@ -1423,16 +1423,14 @@ Client :< {
 	}
 
 	# TODO: a mode's exclusive and blocked keys
-	hints :: fn(self) [](string, string) {
+	hints :: fn(self) (rows: [](string, string), groups: int) {
 		depth :: self.typed.len()
 		mode :: self.modes_on.last() or ""
-		seen: [string]() = .[]
 		bindings: []keymap.Binding = loop binding in self.km.bindings {
 			scope :: binding.mode or ""
 			if binding.keys.len() <= depth || binding.action !in self.can do continue
 			if scope !in [mode, ""] || depth == 0 && scope != mode do continue
-			if !keymap.matches(binding.keys, self.typed) || binding.keys[depth] in seen do continue
-			seen[binding.keys[depth]] = ()
+			if !keymap.matches(binding.keys, self.typed) do continue
 			binding
 		}
 		keymap.hint_rows(bindings, depth, self.titles)
@@ -1441,7 +1439,7 @@ Client :< {
 	which :: fn(self) string {
 		if self.typed.len() == 0 && self.modes_on.len() == 0 do return ""
 
-		hints :: self.hints()
+		hints, groups :: self.hints()
 		if hints.len() == 0 do return ""
 
 		bottom :: self.rows - if self.bare do 0 else do 1
@@ -1483,7 +1481,11 @@ Client :< {
 					cols :: loop col in 0..key_widths.len() {
 						at :: col * nrows + row
 						key, title :: if at < shown.len() do shown[at] else do ("", "")
-						pad(key, key_widths[col]) + " " + pad(cut(title, title_widths[col]), title_widths[col])
+						cell :: pad(key, key_widths[col]) + " " + pad(cut(title, title_widths[col]), title_widths[col])
+
+						if at < groups {
+							"\e[38;5;220m" + cell + "\e[39m"
+						} else do cell
 					}
 					cols |> $.join(" │ ")
 				}
@@ -2669,7 +2671,14 @@ wcwidth : fn(c: i32) i32 : foreign
 
 # TODO: libc's widths, emoji can differ from the outer terminal's
 cells :: fn(text: string) width: int {
-	loop char in text.runes() do width += max(unsafe wcwidth(i32.(char)), 0)
+	esc := false
+	loop char in text.runes() {
+		esc = esc || char == '\e'
+		if !esc {
+			width += max(unsafe wcwidth(i32.(char)), 0)
+		}
+		esc = esc && char != 'm'
+	}
 	return
 }
 describe :: fn(peer: Peer) string {
@@ -2699,11 +2708,15 @@ big :: fn(text: string) []string {
 
 fit :: fn(text: string, width: int) string {
 	out := ""
-	used := 0
+	used, esc := 0, false
 	loop char in text.runes() {
-		used += cells(char.str())
+		esc = esc || char == '\e'
+		if !esc {
+			used += cells(char.str())
+		}
 		if used > width do break
 		out += char.str()
+		esc = esc && char != 'm'
 	}
 	out
 }
