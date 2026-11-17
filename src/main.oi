@@ -1440,22 +1440,27 @@ Client :< {
 
 	which :: fn(self) string {
 		if self.typed.len() == 0 && self.modes_on.len() == 0 do return ""
+
 		hints :: self.hints()
 		if hints.len() == 0 do return ""
+
 		bottom :: self.rows - if self.bare do 0 else do 1
 		if bottom < 3 do return ""
+
 		rows, w := []string.{}, 0
 		loop cap in [24, 16, 12] {
 			all := false
 			loop ncols in 1..=hints.len() {
 				nrows :: min((hints.len() + ncols - 1) / ncols, bottom - 2)
 				if (ncols - 1) * nrows >= hints.len() do continue
+
 				shown := hints
 				room :: ncols * nrows
 				if hints.len() > room {
 					shown = hints[..(room - 1)]
 					shown << ("…", "{hints.len() - room + 1} more")
 				}
+
 				key_widths, title_widths := []int.{}, []int.{}
 				loop (key, title), i in shown {
 					if i % nrows == 0 {
@@ -1466,22 +1471,27 @@ Client :< {
 					key_widths[col] = max(key_widths[col], cells(key))
 					title_widths[col] = max(title_widths[col], min(cells(title), cap))
 				}
-				width := 2 * (key_widths.len() - 1)
-				loop col in 0..key_widths.len() do width += key_widths[col] + 1 + title_widths[col]
+
+				width := 3 * (key_widths.len() - 1)
+				loop col in 0..key_widths.len() {
+					width += key_widths[col] + 1 + title_widths[col]
+				}
 				if ncols > 1 && width > self.cols - 4 do continue
+
 				w = min(width, self.cols - 4)
 				rows = loop row in 0..nrows {
 					cols :: loop col in 0..key_widths.len() {
 						at :: col * nrows + row
-						if at >= shown.len() do continue
-						pad(shown[at].0, key_widths[col]) + " " + pad(cut(shown[at].1, title_widths[col]), title_widths[col])
+						key, title :: if at < shown.len() do shown[at] else do ("", "")
+						pad(key, key_widths[col]) + " " + pad(cut(title, title_widths[col]), title_widths[col])
 					}
-					cols |> $.join("  ")
+					cols |> $.join(" │ ")
 				}
 				all = shown.len() == hints.len()
 			}
 			if all do break
 		}
+
 		title :: if self.typed.len() > 0 {
 			self.typed.map({ $[0] }) |> $.join(" ")
 		} else {
