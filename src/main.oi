@@ -9,7 +9,7 @@ use json
 use math.{ min, max, clamp }
 use json.{ Json, Obj }
 use rex
-use rex.{ Sessions, Session, View, Window, Layer, Node, Split, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
+use rex.{ Sessions, Session, View, Window, Layer, Block, Node, Split, Attached, Created, NewWindow, Ok, Process, Proc, Rex1, Outer, Body, Change, Leaf, leaves, cell }
 use cc
 use cc.{ out }
 use strip
@@ -24,7 +24,6 @@ use encoding.base64
 Done :: struct { client_actions: ?[]keymap.Binding }
 Clients :: struct { clients: ?[]Peer }
 Blocks :: struct { blocks: []Block }
-Block :: struct { block_id: string, label: ?string }
 Peer :: struct { client_id: ?string, principal: Principal, info: ?Info, connection_state: ?string }
 Principal :: struct { display: string }
 Info :: struct { name: ?string, version: ?string, label: ?string }
@@ -2436,6 +2435,7 @@ Client :< {
 				self.ok("session.set_layer_state", ["layer_id" = id, "state" = "normal", "focus" = true])?
 			},
 			"layer.new" => self.pop(opts.command or "")?,
+			"layer.scratch" => self.scratch()?,
 			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
 			"pane.last" => self.focus(self.last_bid[self.wid] or return error("no last pane"))?,
 			"pane.next" => self.ok("session.focus_next_pane", ["wrap" = true])?,
@@ -2535,6 +2535,26 @@ Client :< {
 			opts["exit"] = ["quick_exit_threshold_ms" = 0.0]
 		}
 		self.ok("session.new_layer", ["bounds" = popup(), "layout" = rex.shell(self.here(), opts), "focus" = true])?
+	}
+
+	scratch :: fn(mut self) ! {
+		loop layer in self.win().layers {
+			blocks :: layer.blocks or []
+			if !blocks.any({ ($.label or "") == "scratch" }) do continue
+
+			shown :: (layer.state or "") != "minimized" && blocks.any({ $.block_id == self.bid })
+			state :: if shown do "minimized" else do "normal"
+			return self.ok("session.set_layer_state", [
+				"layer_id" = layer.layer_id or "",
+				"state" = state,
+				"focus" = !shown,
+			])
+		}
+		self.ok("session.new_layer", [
+			"bounds" = popup(),
+			"layout" = rex.shell(self.here(), label = "scratch"),
+			"focus" = true,
+		])?
 	}
 
 	relayout_tab :: fn(mut self; name: string) ! {

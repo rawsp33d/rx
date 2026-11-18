@@ -6,17 +6,20 @@ use json
 use json.{ Json, Obj }
 use math.{ max }
 
-pub shell :: fn(cwd := "", options: Obj = []) Obj {
+pub shell :: fn(cwd := "", options: Obj = [], label := "") Obj {
 	opts := options
 	if cwd != "" do opts["cwd"] = cwd
-	["block" = ["flavor" = "com.superlogical.terminal.shell", "options" = opts]]
+	block: Obj = ["flavor" = "com.superlogical.terminal.shell", "options" = opts]
+	if label != "" do block["label"] = label
+	["block" = block]
 }
 
 pub Session :: struct { pub session_id: string, pub label: string }
 pub Sessions :: struct { pub sessions: []Session }
 pub View :: struct { pub revision: int, pub label: ?string, pub active_window_id: ?string, pub windows: ?[]Window }
 pub Window :: struct { pub window_id: string, pub label: ?string, pub focused_block_id: ?string, pub zoomed_block_id: ?string, pub layers: []Layer }
-pub Layer :: struct { pub layer_id: ?string, pub kind: string, pub bounds: []float, pub state: ?string, pub layout: ?Json }
+pub Layer :: struct { pub layer_id: ?string, pub kind: string, pub bounds: []float, pub state: ?string, pub layout: ?Json, pub blocks: ?[]Block }
+pub Block :: struct { pub block_id: string, pub label: ?string }
 pub Node :: struct { pub rect: []float, pub block_id: ?string, pub split: ?Split }
 pub Split :: struct { pub direction: string, pub ratio: float, pub before: Json, pub after: Json }
 pub Attached :: struct { pub client_id: string, pub view: View }
