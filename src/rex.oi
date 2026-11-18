@@ -9,9 +9,12 @@ use math.{ max }
 pub shell :: fn(cwd := "", options: Obj = [], label := "") Obj {
 	opts := options
 	if cwd != "" do opts["cwd"] = cwd
-	block: Obj = ["flavor" = "com.superlogical.terminal.shell", "options" = opts]
-	if label != "" do block["label"] = label
-	["block" = block]
+
+	["block" = [
+		"flavor" = "com.superlogical.terminal.shell",
+		"options" = opts,
+		"label" = label,
+	]]
 }
 
 pub Session :: struct { pub session_id: string, pub label: string }

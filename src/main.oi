@@ -2435,7 +2435,8 @@ Client :< {
 				self.ok("session.set_layer_state", ["layer_id" = id, "state" = "normal", "focus" = true])?
 			},
 			"layer.new" => self.pop(opts.command or "")?,
-			"layer.scratch" => self.scratch()?,
+			"layer.scratch" => self.scratch("scratch", self.view.windows or [])?,
+			"layer.scratch_tab" => self.scratch("tab scratch", [self.win()])?,
 			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
 			"pane.last" => self.focus(self.last_bid[self.wid] or return error("no last pane"))?,
 			"pane.next" => self.ok("session.focus_next_pane", ["wrap" = true])?,
@@ -2537,11 +2538,18 @@ Client :< {
 		self.ok("session.new_layer", ["bounds" = popup(), "layout" = rex.shell(self.here(), opts), "focus" = true])?
 	}
 
-	scratch :: fn(mut self) ! {
-		loop layer in self.win().layers {
+	scratch :: fn(mut self; label: string, wins: []Window) ! {
+		loop win in wins; layer in win.layers {
 			blocks :: layer.blocks or []
-			if !blocks.any({ ($.label or "") == "scratch" }) do continue
+			block :: blocks.find({ ($.label or "") == label }) or continue
 
+			if win.window_id != self.wid {
+				tiled :: leaves(self.win().layers[0].layout or :null)
+				if tiled.len() == 0 do return error("no tiled pane")
+				self.ok("session.move_block", ["block_id" = block.block_id, "anchor_block_id" = tiled[0].bid])?
+				self.ok("session.float_block", ["block_id" = block.block_id, "bounds" = layer.bounds.map({ Json.($) })])?
+				return self.focus(block.block_id)
+			}
 			shown :: (layer.state or "") != "minimized" && blocks.any({ $.block_id == self.bid })
 			state :: if shown do "minimized" else do "normal"
 			return self.ok("session.set_layer_state", [
@@ -2552,7 +2560,7 @@ Client :< {
 		}
 		self.ok("session.new_layer", [
 			"bounds" = popup(),
-			"layout" = rex.shell(self.here(), label = "scratch"),
+			"layout" = rex.shell(self.here(), label = label),
 			"focus" = true,
 		])?
 	}

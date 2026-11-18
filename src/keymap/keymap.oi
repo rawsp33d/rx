@@ -57,6 +57,7 @@ pub REQUEST :: r"""{
 		{"name": "layer.close", "kind": "client", "title": "close layer"},
 		{"name": "layer.toggle_all", "kind": "client", "title": "toggle layers"},
 		{"name": "layer.scratch", "kind": "client", "title": "toggle scratch float"},
+		{"name": "layer.scratch_tab", "kind": "client", "title": "toggle tab scratch float"},
 		{"name": "tab.new", "kind": "client", "title": "new tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
 		{"name": "tab.next", "kind": "client", "title": "next tab"},
 		{"name": "tab.previous", "kind": "client", "title": "previous tab"},
