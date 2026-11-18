@@ -128,7 +128,7 @@ Term :< {
 	}
 
 	# TODO: highlight where a match wraps onto the next row
-	pub draw :: fn(self; x, y, w, h: int, all: bool, dim := false, marks: []int = [], width := 0) string {
+	pub draw :: fn(self; x, y, w, h: int, all: bool, dim := false, marks: []int = [], width := 0, link := -1, reach := 0) string {
 		top, _, _ :: self.viewport()
 		cols :: self.cols()
 		buf :: self.buf
@@ -145,8 +145,10 @@ Term :< {
 		loop {
 			more :: unsafe ghostty_render_state_row_iterator_next_dirty(self.rows, buf)
 			if !more do break
+
 			row :: int.(unsafe buf.read[u16]())
 			if row >= h do continue
+
 			drawn = true
 			out.write("\e[{y + row + 1};{x + 1}H")
 			unsafe buf.write(self.cells)
@@ -157,24 +159,38 @@ Term :< {
 			if unsafe ghostty_render_state_row_get(self.rows, 4, sel) == 0 { # SELECTION
 				lo, hi = int.(unsafe sel.offset(8).read[u16]()), int.(unsafe sel.offset(10).read[u16]())
 			}
-			at: []int = loop mark in marks { if mark / cols != top + row do continue; mark % cols }
+
+			at: []int = loop mark in marks {
+				if mark / cols != top + row do continue
+				mark % cols
+			}
+
+			under :: if link >= 0 && link / cols == top + row do link % cols else do -1
 			sgr, col := "", 0
 			loop col < w {
 				more :: unsafe ghostty_render_state_row_cells_next(self.cells)
 				if !more do break
+
 				discard unsafe ghostty_render_state_row_cells_get(self.cells, 1, buf) # RAW
 				raw :: unsafe buf.read[u64]()
 				discard unsafe ghostty_cell_get(raw, 3, buf) # WIDE
 				wide :: unsafe buf.read[i32]()
+
 				if wide == 2 do continue # spacer tail
 				if wide == 1 && col + 1 >= w do break
+
 				style := self.sgr(raw)
 				if col >= lo && col <= hi {
 					style = style[..(style.len() - 1)] + ";7m"
 				} else {
 					loop start in at {
-						if col >= start && col < start + width do style = style[..(style.len() - 1)] + ";30;43m"
+						if col >= start && col < start + width {
+							style = style[..(style.len() - 1)] + ";30;43m"
+						}
 					}
+				}
+				if under >= 0 && col >= under && col < under + reach {
+					style = style[..(style.len() - 1)] + ";4m"
 				}
 				if dim do style = style[..(style.len() - 1)] + ";2m"
 				if style != sgr {
@@ -205,7 +221,9 @@ Term :< {
 				discard unsafe ghostty_cell_get(raw, 10, buf) # COLOR_PALETTE
 				return "\e[0" + palette(int.(unsafe buf.read[u8]()), 40) + "m"
 			}
+
 			if tag != 3 do return "\e[0m" # BG_COLOR_RGB
+
 			discard unsafe ghostty_cell_get(raw, 11, buf) # COLOR_RGB
 			return "\e[0;48;2;{rgb(buf)}m"
 		}

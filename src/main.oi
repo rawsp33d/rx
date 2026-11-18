@@ -41,9 +41,33 @@ Removed :: struct { ids: []string }
 
 reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
 
-# one tracking mode clears the others, so keep the program's motion
-mouse_on :: fn(term: ghostty.Term) string {
-	(if term.mode(1003) do "\e[?1003h" else do "\e[?1002h") + "\e[?1006h"
+# all motion for link hover
+mouse_on :: "\e[?1003h\e[?1006h"
+
+Link :: struct { bid: string, at, reach: int }
+
+# an OSC 8 link or a plain url under a cell, and the cells it spans
+link_at :: fn(term: ghostty.Term, x, y: int) (string, int, int) {
+	url :: term.link(x, y)
+	if url == "" {
+		hit :: hits(term, y).find({
+			$.text.contains("://") && $.x <= x && x < $.x + $.text.len()
+		}) or return ("", 0, 0)
+		return (hit.text, hit.x, hit.x + hit.text.len())
+	}
+
+	from, to := x, x + 1
+	loop from > 0 && term.link(from - 1, y) == url {
+		from -= 1
+	}
+	loop to < term.cols() && term.link(to, y) == url {
+		to += 1
+	}
+	(url, from, to)
+}
+
+browse :: fn(url: string) {
+	discard os.sh("xdg-open {quote(url)} >/dev/null 2>&1 &")
 }
 
 # secs a program may hold a frame (2026)
@@ -697,14 +721,14 @@ Pane :< {
 		ours
 	}
 
-	draw :: fn(mut self; all, dim: bool, cp: Copy) string {
+	draw :: fn(mut self; all, dim: bool, cp: Copy, link: Link) string {
 		if !self.painted do return ""
 		held :: !all && self.term.held()
 		if held && !self.holding do self.since = time.Instant.now()
 		self.holding = held
 		if held && self.since.elapsed() < hold.sec() do return ""
 		self.full = false
-		self.term.draw(self.x, self.y, self.w, self.h, all, dim, cp.marks, cells(cp.needle))
+		self.term.draw(self.x, self.y, self.w, self.h, all, dim, cp.marks, cells(cp.needle), link.at, link.reach)
 	}
 
 	close :: fn(self) {
@@ -790,6 +814,7 @@ Client :: struct {
 	parked: []Copy
 	buffers: []string
 	drag: Drag
+	link: Link
 	clicks: int
 	click, flash: string
 	click_at: time.Instant
@@ -1217,14 +1242,15 @@ Client :< {
 				if redraw do frame += self.borders(layer)
 			}
 			bid :: self.panes[i].bid
-			drawn :: self.panes[i].draw(redraw, self.dim && bid != self.bid, self.copy_of(bid))
+			link :: if self.link.bid == bid do self.link else do Link.{}
+			drawn :: self.panes[i].draw(redraw, self.dim && bid != self.bid, self.copy_of(bid), link)
 			if drawn != "" do over = true
 			frame += drawn
 			pane :: self.panes[i]
 			if pane.bid != self.bid || !pane.painted do continue
 			# always bracket pastes so input can tell them from typing
 			keyboard :: if self.cp.bid == pane.bid do reset_modes else do pane.term.modes() + "\e[?2004h"
-			modes :: keyboard + if self.mouse_off do "" else do mouse_on(pane.term)
+			modes :: keyboard + if self.mouse_off do "" else do mouse_on
 			if modes != self.modes {
 				frame += modes
 				self.modes = modes
@@ -1699,6 +1725,7 @@ Client :< {
 		if button < 0 do return ""
 		if self.drag.kind != "" && (up || button & 32 != 0) do return self.dragged(button, x, y, up)
 		self.drag = Drag.{} # lost the release
+		if button & 35 == 35 do self.hover(x, y)
 		press :: !up && button & 96 == 0
 		left :: press && button & 3 == 0
 		if y == self.rows - 1 && !self.bare {
@@ -1752,9 +1779,9 @@ Client :< {
 			}
 			if left && button & 16 != 0 && pane.painted {
 				start, _, _ := pane.term.viewport()
-				link :: pane.term.link(x - pane.x, start + y - pane.y)
-				if link != "" {
-					discard os.sh("xdg-open {quote(link)} >/dev/null 2>&1 &")
+				url, _, _ :: link_at(pane.term, x - pane.x, start + y - pane.y)
+				if url != "" {
+					browse(url)
 					self.drag = Drag.{ kind = "eat" }
 					return ""
 				}
@@ -1783,16 +1810,46 @@ Client :< {
 		""
 	}
 
+	hover :: fn(mut self; x, y: int) {
+		link := Link.{}
+		loop pane in self.panes {
+			if !pane.painted || x < pane.x || x >= pane.x + pane.w || y < pane.y || y >= pane.y + pane.h {
+				continue
+			}
+
+			top, _, _ := pane.term.viewport()
+			row :: top + y - pane.y
+			url, from, to :: link_at(pane.term, x - pane.x, row)
+			link = if url == "" {
+				Link.{}
+			} else {
+				Link.{
+					bid = pane.bid,
+					at = row * pane.term.cols() + from,
+					reach = to - from,
+				}
+			}
+		}
+		if link.bid == self.link.bid && link.at == self.link.at do return
+
+		self.link = link
+		self.redraw()
+	}
+
 	pressed :: fn(mut self; pane: Pane, button, x, y: int) {
 		if button & 3 == 1 do self.paste(pane) or { self.say($.message(), true) }
 		if button & 3 == 2 {
 			if pane.bid != self.bid {
 				self.focus(pane.bid) or return
-				self.bid = pane.bid # the view lags, the menu needs it now
+				self.bid = pane.bid
 			}
-			self.detach = self.menu(pane.x + x, pane.y + y, "Pane", pane_items()) or { self.say($.message(), true); false }
+			self.detach = self.menu(pane.x + x, pane.y + y, "Pane", pane_items()) or {
+				self.say($.message(), true)
+				false
+			}
 		}
 		if button & 3 != 0 do return
+
 		discard self.count("{pane.bid} {x} {y}")
 		top, _, _ := pane.term.viewport()
 		row :: top + y
@@ -1800,8 +1857,12 @@ Client :< {
 			self.drag = Drag.{ kind = "select", x = x, y = row, id = pane.bid, block = button & 8 != 0 }
 			return
 		}
+
 		ax, bx := 0, pane.term.cols() - 1
-		if self.clicks == 2 do ax, bx = word(pane.term, x, row)
+		if self.clicks == 2 {
+			ax, bx = word(pane.term, x, row)
+		}
+
 		pane.term.select(ax, row, bx, row)
 		self.flash = pane.bid
 		self.full = true
@@ -2073,6 +2134,10 @@ Client :< {
 				self.clip(self.cp.copy(pane.term))
 				self.stop_copy()
 				self.say("copied")
+			}
+			if !drag.moved {
+				url, _, _ :: link_at(pane.term, drag.x, drag.y)
+				if url != "" do browse(url)
 			}
 			return
 		}
