@@ -327,9 +327,11 @@ pclose : fn(f: ptr) i32 : foreign
 fflush : fn(f: ptr) i32 : foreign
 
 # popen by hand, os.sh keeps no output
-zoxide :: fn(query: string) !string {
-	file :: unsafe popen("zoxide query -- {quote(query)} 2>/dev/null".cstr(), "r".cstr())
+zoxide :: fn(query: string, flags := "") !string {
+	words :: query.split(" ").filter({ $ != "" }).map({ quote($) }).join(" ")
+	file :: unsafe popen("zoxide query {flags} -- {words} 2>/dev/null".cstr(), "r".cstr())
 	if file.is_null() do return error("cannot run zoxide")
+
 	out: []u8
 	loop {
 		byte :: unsafe libc.fgetc(file)
@@ -337,6 +339,7 @@ zoxide :: fn(query: string) !string {
 		out << u8.(byte)
 	}
 	if unsafe pclose(file) != 0 do return error("zoxide: no match for {query}")
+
 	string.(out).trim()
 }
 
@@ -421,7 +424,6 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 	marks: []string
 	cmds :: [
 	("alt+enter" "new")
-		("ctrl+w" "warp")
 		("ctrl+r" "rename")
 		("tab" "mark")
 		("ctrl+x" "close")
@@ -440,7 +442,22 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			mark :: if session.session_id in marks do "x" else do " "
 			"{number} {here}{other}{mark} "
 		}
-		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds, tags, numbered = true, search = search)
+		labels :: sessions.map({ $.label })
+		home :: os.env("HOME") or ""
+
+		# enter takes the dir drawn, zoxide's db can change under it
+		cache: [string][]string = .[]
+		rows :: fn [mut cache, home, labels] (query: string) []string {
+			if query != "" && query !in cache {
+				found :: zoxide(query, "-l") or ""
+				cache[query] = found.split("\n").filter({ $ != "" && fs.Path.($).name() !in labels })
+			}
+			loop dir in cache[query] or [] {
+				"new in " + if dir.starts_with(home) do "~" + dir[home.len()..] else do dir
+			}
+		}
+
+		picked, name, query, more :: choose("Sessions", labels, input, rest, i, cmds, tags, numbered = true, search = search, more = rows)
 		rest, search = more, query
 
 		if picked >= 0 do i = picked
@@ -453,12 +470,10 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			return (if query == "" do "main" else do named([query]), "")
 		}
 
-		if name == "ctrl+w" {
-			if query == "" {
-				bad = "type where to warp first"
-				continue
-			}
-			return (query, zoxide(query) or { bad = $.message(); continue })
+		if picked >= sessions.len() {
+			dir :: (cache[query] or [])[picked - sessions.len()]
+			if name == "enter" do return (fs.Path.(dir).name(), dir)
+			continue
 		}
 
 		if picked < 0 do continue
@@ -536,6 +551,7 @@ choose :: fn(
 	tags: []string = [],
 	numbered := false,
 	search := "",
+	more: fn(string) []string = { [] },
 ) (picked: int, name, query, rest: string) {
 	picked, rest, query = -1, pending, search
 	size :: tty.size(1) or return
@@ -548,8 +564,7 @@ choose :: fn(
 
 	shortcuts << ("esc", "cancel")
 	foot :: legend(shortcuts, w - 2)
-	visible :: max(min(items.len(), rows - 6 - foot.len()), 1)
-	x, y :: (cols - w - 2) / 2, max((rows - visible - foot.len() - 6) / 2, 0)
+	x, visible := (cols - w - 2) / 2, 1
 	gutter := 0
 
 	loop tag in tags do gutter = max(gutter, cells(tag))
@@ -558,7 +573,15 @@ choose :: fn(
 	i := items[..min(at, items.len())].filter({ fuzzy(query, $) }).len()
 	loop {
 		picked, name = -1, ""
-		hits: []int = loop item, k in items { if !fuzzy(query, item) do continue; k }
+		all :: [..items, ..more(query)]
+		hits: []int = loop item, k in all {
+			if k < items.len() && !fuzzy(query, item) do continue
+			k
+		}
+
+		# only grows, a smaller box leaves the old one's edges
+		visible = max(visible, min(all.len(), rows - 6 - foot.len()))
+		y :: max((rows - visible - foot.len() - 6) / 2, 0)
 
 		i = clamp(i, 0, max(hits.len() - 1, 0))
 		off :: max(i - visible + 1, 0)
@@ -566,7 +589,7 @@ choose :: fn(
 			if k + off < hits.len() {
 				hit :: hits[k + off]
 				tag :: if hit < tags.len() do tags[hit] else do ""
-				pad(tag, gutter) + accent(items[hit], matches(query, items[hit]))
+				pad(tag, gutter) + accent(all[hit], matches(query, all[hit]))
 			} else do ""
 		}
 		on :: if hits.len() > 0 do i - off else do -1
