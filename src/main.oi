@@ -30,7 +30,7 @@ Info :: struct { name: ?string, version: ?string, label: ?string }
 
 Clip :: struct { text: ?string, id: ?int, bytes: ?int }
 Part :: struct { data: string, eof: bool }
-Text :: struct { content: string }
+Text :: struct { content: string, id: ?int, total: ?int }
 Note :: struct { title: string, body: string }
 Title :: struct { title: string }
 Status :: struct { id: string, record: Record }
@@ -40,12 +40,12 @@ Removed :: struct { ids: []string }
 
 reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
 
-# all motion for link hover
+## All motion for link hover.
 mouse_on :: "\e[?1003h\e[?1006h"
 
 Link :: struct { bid: string, at, reach: int }
 
-# an OSC 8 link or a plain url under a cell, and the cells it spans
+## An OSC 8 link or a plain url under a cell, and the cells it spans.
 link_at :: fn(term: ghostty.Term, x, y: int) (string, int, int) {
 	url :: term.link(x, y)
 	if url == "" {
@@ -422,6 +422,7 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 	bad, rest, search: string
 	bottom :: "\e[999;1H\e[0m\e[2K "
 	marks: []string
+	previews: [string][]string
 	cmds :: [
 	("alt+enter" "new")
 		("ctrl+r" "rename")
@@ -457,7 +458,15 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			}
 		}
 
-		picked, name, query, more :: choose("Sessions", labels, input, rest, i, cmds, tags, numbered = true, search = search, more = rows)
+		look :: fn [mut previews, sock, sessions] (index: int) []string {
+			sid :: sessions[index].session_id
+			if sid !in previews do previews[sid] = peek(sock, sid) or []
+			previews[sid] or []
+		}
+
+		picked, name, query, more :: choose(
+			"Sessions", labels, input, rest, i, cmds, tags, numbered = true, search = search, more = rows, preview = look,
+		)
 		rest, search = more, query
 
 		if picked >= 0 do i = picked
@@ -552,19 +561,21 @@ choose :: fn(
 	numbered := false,
 	search := "",
 	more: fn(string) []string = { [] },
+	preview: ?fn(int) []string = none,
 ) (picked: int, name, query, rest: string) {
 	picked, rest, query = -1, pending, search
 	size :: tty.size(1) or return
 
 	cols, rows :: int.(size.cols), int.(size.rows)
-	w :: min(cols - 2, 60)
+	wide :: cols >= 100 && preview != none
+	w :: if wide do 40 else do min(cols - 2, 60)
 	shortcuts := [("enter", "pick")]
 	shortcuts << cmds
 	if numbered do shortcuts << ("alt+1-9", "goto")
 
 	shortcuts << ("esc", "cancel")
 	foot :: legend(shortcuts, w - 2)
-	x, visible := (cols - w - 2) / 2, 1
+	x, visible := if wide do 0 else do (cols - w - 2) / 2, 1
 	gutter := 0
 
 	loop tag in tags do gutter = max(gutter, cells(tag))
@@ -580,7 +591,7 @@ choose :: fn(
 		}
 
 		# only grows, a smaller box leaves the old one's edges
-		visible = max(visible, min(all.len(), rows - 6 - foot.len()))
+		visible = max(visible, min(if wide do rows else do all.len(), rows - 6 - foot.len()))
 		y :: max((rows - visible - foot.len() - 6) / 2, 0)
 
 		i = clamp(i, 0, max(hits.len() - 1, 0))
@@ -594,6 +605,17 @@ choose :: fn(
 		}
 		on :: if hits.len() > 0 do i - off else do -1
 		out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> " + query], foot))
+
+		if look := preview; wide {
+			lines: []string = if on >= 0 && hits[i] < items.len() do look(hits[i]) else do []
+			# as tall as the list box, with its query and rules
+			height :: visible + foot.len() + 3
+			skip :: max(lines.len() - height, 0)
+			tail: []string = loop j in 0..height {
+				if j + skip < lines.len() do lines[j + skip] else do ""
+			}
+			out(box(x + w + 2, y, cols - w - 4, "", tail))
+		}
 		out("\e[{y + 2};{x + 5 + cells(query)}H\e[?25h\e[?2026l")
 
 		if rest == "" do rest = input.recv() or return
@@ -628,6 +650,31 @@ manage :: fn(sock, method: string, payload: Obj) ![]Session {
 	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
 	discard conn.call[Ok](method, payload)?
 	conn.call[Sessions]("session.list")?.sessions
+}
+
+## The active tab's focused pane, as text.
+peek :: fn(sock, sid: string) ![]string {
+	conn := rex.connect(sock)?
+	defer conn.close()
+
+	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
+	view :: conn.call[View]("session.view", ["session_id" = sid])?
+	win :: (view.windows or []).find({ $.window_id == (view.active_window_id or "") }) or return []
+
+	args: Obj = [
+		"session_id" = sid,
+		"block_id" = win.focused_block_id or "",
+		"args" = ["trim" = true, "max_bytes" = 1.0],
+	]
+	text :: conn.call[Text]("com.superlogical.terminal.format", args)?
+	id :: text.id or return text.content.split("\n").map(printable)
+
+	# a long scrollback won't fit one reply, and only its tail shows
+	tail :: 32768
+	from :: max((text.total or 0) - tail, 0)
+	args["args"] = ["id" = float.(id), "offset" = float.(from), "max_bytes" = float.(tail)]
+	lines :: conn.call[Part]("com.superlogical.terminal.blob_read", args)?.data.split("\n")
+	lines[(if from > 0 do 1 else do 0)..].map(printable)
 }
 
 ask :: fn(
