@@ -652,14 +652,15 @@ manage :: fn(sock, method: string, payload: Obj) ![]Session {
 	conn.call[Sessions]("session.list")?.sessions
 }
 
-## The active tab's focused pane, as text.
-peek :: fn(sock, sid: string) ![]string {
+## A tab's focused pane as text, the active tab's by default.
+peek :: fn(sock, sid: string, wid := "") ![]string {
 	conn := rex.connect(sock)?
 	defer conn.close()
 
 	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
 	view :: conn.call[View]("session.view", ["session_id" = sid])?
-	win :: (view.windows or []).find({ $.window_id == (view.active_window_id or "") }) or return []
+	tab :: if wid != "" do wid else do view.active_window_id or ""
+	win :: (view.windows or []).find({ $.window_id == tab }) or return []
 
 	args: Obj = [
 		"session_id" = sid,
@@ -2223,9 +2224,9 @@ Client :< {
 		self.perform(keymap.Binding.{ action = action.name, args = Json.(args) }, keys.Key.{})
 	}
 
-	choose :: fn(mut self; title: string, items: []string) int {
+	choose :: fn(mut self; title: string, items: []string, preview: ?fn(int) []string = none) int {
 		self.modes = ""
-		i, _, _, rest :: choose(title, items, self.keys, self.unread)
+		i, _, _, rest :: choose(title, items, self.keys, self.unread, preview = preview)
 		self.unread = rest
 		self.redraw()
 		i
@@ -2688,7 +2689,13 @@ Client :< {
 						wids << wins[i].window_id
 					}
 				}
-				i :: self.choose(title, items)
+				previews: [string][]string
+				sock :: self.sock
+				look :: fn [mut previews, sock, sids, wids] (index: int) []string {
+					if wids[index] !in previews do previews[wids[index]] = peek(sock, sids[index], wids[index]) or []
+					previews[wids[index]] or []
+				}
+				i :: self.choose(title, items, look)
 				if i < 0 do return false
 				return self.act("session.select", Json.(["session_id" = sids[i], "window_id" = wids[i]]))
 			},
