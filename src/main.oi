@@ -357,6 +357,8 @@ run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []str
 		}
 		if sid != cur do prev, cur = cur, sid
 		att :: conn.call[Attached]("session.attach", ["session_id" = sid])?
+		fs.mkdir(fs.Path.(state())) or {}
+		fs.write(fs.Path.(state() + "/last"), sid) or {}
 		view := att.view
 		if (view.windows or []).len() == 0 {
 			discard conn.call[Ok]("session.new_window", ["session_id" = sid, "layout" = rex.shell(os.cwd())])?
@@ -390,9 +392,14 @@ run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []str
 pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: string) (string, string) {
 	sessions := sessions
 	i := 0
-	loop session, j in sessions {
-		if session.label == at do i = j
+	start :: if at != "" do at else {
+		fs.read(fs.Path.(state() + "/last")) or ""
 	}
+
+	loop session, j in sessions {
+		if start in [session.label, session.session_id] do i = j
+	}
+
 	bad := ""
 	bottom :: "\e[999;1H\e[0m\e[2K "
 	cmds :: [("alt+enter", "new"), ("ctrl+w", "warp"), ("ctrl+r", "rename"), ("ctrl+x", "close"), ("alt+up", "move up"), ("alt+down", "move down")]
@@ -408,10 +415,10 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			if name != "" && sessions.any({ $.label == at }) do return (at, "")
 			return ("", "")
 		}
-		if name == "alt+enter" || name == "enter" && picked < 0 {
-			if query != "" do return (query, "")
-			continue
+		if name == "alt+enter" || name == "enter" && (picked < 0 || query == ".") {
+			return (if query == "" do "main" else do named([query]), "")
 		}
+
 		if name == "ctrl+w" {
 			if query == "" {
 				bad = "type where to warp first"
@@ -419,9 +426,12 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			}
 			return (query, zoxide(query) or { bad = $.message(); continue })
 		}
+
 		if picked < 0 do continue
+
 		id :: sessions[picked].session_id
 		if name == "enter" do return (sessions[picked].label, "")
+
 		if name == "ctrl+r" {
 			label, after :: ask("rename {sessions[picked].label}: ", input, bottom, rest)
 			rest = after
@@ -430,27 +440,35 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 				sessions = manage(sock, "session.set_label", args) or { bad = $.message(); sessions }
 			}
 		}
+
 		if name == "ctrl+x" {
 			out(bottom + "close {sessions[picked].label}? y to confirm")
 			typed :: if rest != "" do rest else do input.recv() or return ("", "")
 			answer :: keys.key_of(typed).0 or continue
+
 			if answer.names[0] == "y" {
 				sessions = manage(sock, "session.destroy", ["session_id" = id]) or { bad = $.message(); sessions }
 			}
 			rest = ""
 		}
+
 		if name == "alt+down" && picked + 1 < sessions.len() {
 			args: Obj = ["session_id" = id]
 			if picked + 2 < sessions.len() do args["before_session_id"] = sessions[picked + 2].session_id
 			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
 			i += 1
 		}
+
 		if name == "alt+up" && picked > 0 {
 			args: Obj = ["session_id" = id, "before_session_id" = sessions[picked - 1].session_id]
 			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
 			i -= 1
 		}
 	}
+}
+
+state :: fn() string {
+	(os.env("XDG_STATE_HOME") or { (os.env("HOME") or "") + "/.local/state" }) + "/rx"
 }
 
 choose :: fn(
