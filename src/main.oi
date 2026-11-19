@@ -416,10 +416,18 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 		if start in [session.label, session.session_id] do i = j
 	}
 
-	bad := ""
+	bad, rest, search: string
 	bottom :: "\e[999;1H\e[0m\e[2K "
-	cmds :: [("alt+enter", "new"), ("ctrl+w", "warp"), ("ctrl+r", "rename"), ("ctrl+x", "close"), ("alt+up", "move up"), ("alt+down", "move down")]
-	rest := ""
+	marks: []string
+	cmds :: [
+	("alt+enter" "new")
+		("ctrl+w" "warp")
+		("ctrl+r" "rename")
+		("tab" "mark")
+		("ctrl+x" "close")
+		("alt+up" "move up")
+		("alt+down" "move down")
+	]
 
 	loop {
 		out("\e[0m\e[H\e[2J" + bottom + "\e[31m{bad}\e[0m")
@@ -429,10 +437,11 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			number :: if j < 9 do "{j + 1}" else do " "
 			here :: if session.label == at do "*" else do " "
 			other :: if counts[j] > 0 do "+" else do " "
-			"{number} {here}{other} "
+			mark :: if session.session_id in marks do "x" else do " "
+			"{number} {here}{other}{mark} "
 		}
-		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds, tags, numbered = true)
-		rest = more
+		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds, tags, numbered = true, search = search)
+		rest, search = more, query
 
 		if picked >= 0 do i = picked
 		if name in ["", "esc", "ctrl+c"] {
@@ -457,6 +466,11 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 		id :: sessions[picked].session_id
 		if name == "enter" do return (sessions[picked].label, "")
 
+		if name == "tab" {
+			marks = toggle(marks, id)
+			i = picked + 1
+		}
+
 		if name == "ctrl+r" {
 			label, after :: ask("rename {sessions[picked].label}: ", input, bottom, rest)
 			rest = after
@@ -467,12 +481,17 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 		}
 
 		if name == "ctrl+x" {
-			out(bottom + "close {sessions[picked].label}? y to confirm")
+			targets :: if marks.len() > 0 do marks else do [id]
+			names :: sessions.filter({ $.session_id in targets }).map({ $.label }).join(", ")
+			out(bottom + "close {names}? y to confirm")
 			typed :: if rest != "" do rest else do input.recv() or return ("", "")
 			answer :: keys.key_of(typed).0 or continue
 
 			if answer.names[0] == "y" {
-				sessions = manage(sock, "session.destroy", ["session_id" = id]) or { bad = $.message(); sessions }
+				loop target in targets {
+					sessions = manage(sock, "session.destroy", ["session_id" = target]) or { bad = $.message(); sessions }
+				}
+				marks = []
 			}
 			rest = ""
 		}
@@ -508,10 +527,17 @@ state :: fn() string {
 }
 
 choose :: fn(
-	title: string, items: []string, input: sync.Chan[string], pending: string, at := 0, cmds: [](string, string) = [],
-	tags: []string = [], numbered := false,
+	title: string,
+	items: []string,
+	input: sync.Chan[string],
+	pending: string,
+	at := 0,
+	cmds: [](string, string) = [],
+	tags: []string = [],
+	numbered := false,
+	search := "",
 ) (picked: int, name, query, rest: string) {
-	picked, rest = -1, pending
+	picked, rest, query = -1, pending, search
 	size :: tty.size(1) or return
 
 	cols, rows :: int.(size.cols), int.(size.rows)
@@ -528,7 +554,8 @@ choose :: fn(
 
 	loop tag in tags do gutter = max(gutter, cells(tag))
 
-	i := at
+	# `at` counts items, `i` counts hits
+	i := items[..min(at, items.len())].filter({ fuzzy(query, $) }).len()
 	loop {
 		picked, name = -1, ""
 		hits: []int = loop item, k in items { if !fuzzy(query, item) do continue; k }
