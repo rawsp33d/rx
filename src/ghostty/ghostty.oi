@@ -77,6 +77,15 @@ pub blank :: fn(cols, rows: int) !Term {
 	Term.new(unsafe out.read[ptr]())
 }
 
+@params
+pub Paint :: struct {
+	pub dim: bool
+	pub marks: []int
+	pub width: int
+	pub link: int = -1
+	pub reach: int
+}
+
 pub Term :: struct {
 	term, state, rows, cells: ptr
 	buf: ptr
@@ -128,15 +137,17 @@ Term :< {
 	}
 
 	# TODO: highlight where a match wraps onto the next row
-	pub draw :: fn(self; x, y, w, h: int, all: bool, dim := false, marks: []int = [], width := 0, link := -1, reach := 0) string {
+	pub draw :: fn(self; x, y, w, h: int, all: bool, with paint: Paint) string {
 		top, _, _ :: self.viewport()
 		cols :: self.cols()
 		buf :: self.buf
+
 		discard unsafe ghostty_render_state_update(self.state, self.term)
 		if all {
 			unsafe buf.write(i32.(2)) # DIRTY_FULL
 			discard unsafe ghostty_render_state_set(self.state, 0, buf) # OPTION_DIRTY
 		}
+
 		unsafe buf.write(self.rows)
 		discard unsafe ghostty_render_state_get(self.state, 4, buf) # ROW_ITERATOR
 		out := Buffer.{}
@@ -165,7 +176,9 @@ Term :< {
 				mark % cols
 			}
 
-			under :: if link >= 0 && link / cols == top + row do link % cols else do -1
+			under :: if paint.link >= 0 && paint.link / cols == top + row {
+				paint.link % cols
+			} else do -1
 			sgr, col := "", 0
 			loop col < w {
 				more :: unsafe ghostty_render_state_row_cells_next(self.cells)

@@ -44,7 +44,7 @@ test! "draw" {
 	screen.write("\e]8;;https://x.io\e\\L\e]8;;\e\\")
 	_, _, all := screen.viewport()
 	assert! screen.link(0, all - 1) == "https://x.io" && screen.link(0, 0) == ""
-	assert! screen.draw(0, 0, 20, 4, true, false, screen.find("re"), 2).starts_with("\e[1;1H\e[0m!i \e[0;1;31;30;43mre\e[0;1;31md")
+	assert! screen.draw(0, 0, 20, 4, true, marks = screen.find("re"), width = 2).starts_with("\e[1;1H\e[0m!i \e[0;1;31;30;43mre\e[0;1;31md")
 	# rows past 256 cols used to get cut short
 	wide :: blank(300, 1) or panic!($.message())
 	defer wide.free()

@@ -151,7 +151,17 @@ cli :: fn(args: []string) ! {
 	if cmd == "." && inside && !readonly && !detached && !alone && layout == "" {
 		proxy(sock, "session rename", [label])
 	}
-	run(sock, label, warp, readonly, alone, cmd == "run", command, layout)
+
+	run(
+		sock,
+		label = label,
+		layout = layout,
+		command = command,
+		warp = warp,
+		readonly = readonly,
+		alone = alone,
+		bare = cmd == "run",
+	)
 }
 
 last :: fn(sock: string) !string {
@@ -343,22 +353,28 @@ zoxide :: fn(query: string, flags := "") !string {
 	string.(out).trim()
 }
 
-run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []string, layout: string) ! {
+Options :: struct {
+	label, layout: string
+	command: []string
+	warp, readonly, alone, bare: bool
+}
+
+run :: fn(sock: string, opts: Options) ! {
 	conn := rex.connect(sock)?
 	defer conn.close()
 	term :: tty.raw(0)?
 	out("\e[?1049h")
 	defer out(reset_modes + "\e[?1049l")
-	input :: tty.input(0)
+	input := Input.{ chan = tty.input(0) }
 	resizes :: tty.resizes(1)
 
-	label := label
-	dir := if warp do zoxide(label)? else do ""
+	label := opts.label
+	dir := if opts.warp do zoxide(label)? else do ""
 	choose := label == ""
 	cur, prev := "", "" # for session.last
 	loop {
 		sessions :: conn.call[Sessions]("session.list")?.sessions
-		if choose do label, dir = pick(sock, sessions, input, label)
+		if choose do label, dir = pick(sock, sessions, mut input, label)
 		if label == "" do break
 		sid := ""
 		if session := sessions.find({ $.label == label || $.session_id == label }) {
@@ -367,11 +383,11 @@ run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []str
 		# it would draw itself inside itself forever
 		if sid != "" && sid == (os.env("REX_SESSION") or "") do return error("already in {label}")
 		if sid == "" {
-			opts: Obj = []
-			if command.len() > 0 do opts["command"] = command.map({ Json.($) })
+			shell: Obj = []
+			if opts.command.len() > 0 do shell["command"] = opts.command.map({ Json.($) })
 			cwd :: if dir != "" do dir else do os.cwd()
-			wins: json.Arr = [["layout" = rex.shell(cwd, opts)]]
-			if layout != "" do wins = windows(layout)?.map({ with_cwd($, cwd) })
+			wins: json.Arr = [["layout" = rex.shell(cwd, shell)]]
+			if opts.layout != "" do wins = windows(opts.layout)?.map({ with_cwd($, cwd) })
 			sid = create(sock, label, wins)?
 		}
 		if sid != cur do prev, cur = cur, sid
@@ -385,12 +401,12 @@ run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []str
 		}
 		client := Client.{
 			conn = conn, sock = sock, sid = sid, cid = att.client_id,
-			owned = !readonly, readonly = readonly, bare = bare, prev = prev,
+			owned = !opts.readonly, readonly = opts.readonly, bare = opts.bare, prev = prev,
 			chunks = sync.Chan[rex.Chunk].{}, keys = input,
 		}
 		client.load_keymap()?
 		# like tmux attach -d
-		if alone {
+		if opts.alone {
 			loop peer in client.others()? do client.kick(peer) or {}
 		}
 		client.apply(view)?
@@ -400,7 +416,7 @@ run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []str
 			return $
 		}
 		client.close()
-		conn = client.conn
+		conn, input = client.conn, client.keys
 		if !client.choose && client.next == "" do break
 		choose = client.next == ""
 		label, dir = if client.next != "" do (client.next, client.dir) else do (label, "")
@@ -408,7 +424,7 @@ run :: fn(sock, label: string, warp, readonly, alone, bare: bool, command: []str
 	}
 }
 
-pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: string) (string, string) {
+pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (string, string) {
 	sessions := sessions
 	i := 0
 	start :: if at != "" do at else {
@@ -419,12 +435,11 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 		if start in [session.label, session.session_id] do i = j
 	}
 
-	bad, rest, search: string
-	bottom :: "\e[999;1H\e[0m\e[2K "
+	bad, search: string
 	marks: []string
 	previews: [string][]string
 	cmds :: [
-	("alt+enter" "new")
+		("alt+enter" "new")
 		("ctrl+r" "rename")
 		("tab" "mark")
 		("ctrl+x" "close")
@@ -464,10 +479,19 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			previews[sid] or []
 		}
 
-		picked, name, query, more :: choose(
-			"Sessions", labels, input, rest, i, cmds, tags, numbered = true, search = search, more = rows, preview = look,
+		picked, name, query :: choose(
+			mut input,
+			title = "Sessions",
+			items = labels,
+			tags = tags,
+			cmds = cmds,
+			numbered = true,
+			at = i,
+			query = search,
+			more = rows,
+			preview = look,
 		)
-		rest, search = more, query
+		search = query
 
 		if picked >= 0 do i = picked
 		if name in ["", "esc", "ctrl+c"] {
@@ -496,8 +520,7 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 		}
 
 		if name == "ctrl+r" {
-			label, after :: ask("rename {sessions[picked].label}: ", input, bottom, rest)
-			rest = after
+			label :: ask(mut input, "rename {sessions[picked].label}: ")
 			if label != "" {
 				args: Obj = ["session_id" = id, "label" = label]
 				sessions = manage(sock, "session.set_label", args) or { bad = $.message(); sessions }
@@ -508,16 +531,13 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			targets :: if marks.len() > 0 do marks else do [id]
 			names :: sessions.filter({ $.session_id in targets }).map({ $.label }).join(", ")
 			out(bottom + "close {names}? y to confirm")
-			typed :: if rest != "" do rest else do input.recv() or return ("", "")
-			answer :: keys.key_of(typed).0 or continue
-
+			answer :: input.next() or return ("", "")
 			if answer.names[0] == "y" {
 				loop target in targets {
 					sessions = manage(sock, "session.destroy", ["session_id" = target]) or { bad = $.message(); sessions }
 				}
 				marks = []
 			}
-			rest = ""
 		}
 
 		if name == "alt+down" && picked + 1 < sessions.len() {
@@ -550,20 +570,41 @@ state :: fn() string {
 	(os.env("XDG_STATE_HOME") or { (os.env("HOME") or "") + "/.local/state" }) + "/rx"
 }
 
-choose :: fn(
-	title: string,
-	items: []string,
-	input: sync.Chan[string],
-	pending: string,
-	at := 0,
-	cmds: [](string, string) = [],
-	tags: []string = [],
-	numbered := false,
-	search := "",
-	more: fn(string) []string = { [] },
-	preview: ?fn(int) []string = none,
-) (picked: int, name, query, rest: string) {
-	picked, rest, query = -1, pending, search
+Input :: struct { chan: sync.Chan[string], unread: string }
+
+Input :< {
+	next :: fn(mut self) ?keys.Key {
+		loop {
+			if self.unread == "" do self.unread = self.chan.recv() or return none
+			# key_of only knows ascii, so a byte past it is text
+			if self.unread[0] >= 0x80 {
+				text :: self.unread[..1]
+				self.unread = self.unread[1..]
+				return keys.Key.{ names = [text], action = "press", text = text }
+			}
+			parsed, used :: keys.key_of(self.unread)
+			self.unread = self.unread[used..]
+			return parsed or continue
+		}
+	}
+}
+
+# the prompt row
+bottom :: "\e[999;1H\e[0m\e[2K "
+
+List :: struct {
+	title: string
+	items, tags: []string
+	cmds: [](string, string)
+	numbered: bool
+	at: int # counts items, not hits
+	query: string
+	more: fn(string) []string = { [] }
+	preview: ?fn(int) []string
+}
+
+choose :: fn(mut input: Input, with list: List) (picked: int, name, query: string) {
+	picked, query = -1, list.query
 	size :: tty.size(1) or return
 
 	cols, rows :: int.(size.cols), int.(size.rows)
@@ -580,7 +621,6 @@ choose :: fn(
 
 	loop tag in tags do gutter = max(gutter, cells(tag))
 
-	# `at` counts items, `i` counts hits
 	i := items[..min(at, items.len())].filter({ fuzzy(query, $) }).len()
 	loop {
 		picked, name = -1, ""
@@ -618,21 +658,13 @@ choose :: fn(
 		}
 		out("\e[{y + 2};{x + 5 + cells(query)}H\e[?25h\e[?2026l")
 
-		if rest == "" do rest = input.recv() or return
-		if rest[0] >= 0x80 {
-			query += rest[..1]
-			rest = rest[1..]
-			continue
-		}
-		parsed, used := keys.key_of(rest)
-		rest = rest[used..]
-		key :: parsed or continue
+		key :: input.next() or return
 		if key.action != "press" do continue
 		name = key.names[0]
 		if name in ["esc", "ctrl+c"] do return
 		if numbered && name.starts_with("alt+") {
 			digit :: int.try_from(name[4..]) or 0
-			if digit >= 1 && digit <= min(items.len(), 9) do return (digit - 1, "enter", query, rest)
+			if digit >= 1 && digit <= min(items.len(), 9) do return (digit - 1, "enter", query)
 		}
 		if i < hits.len() do picked = hits[i]
 		if name == "enter" || cmds.any({ $.0 == name }) do return
@@ -678,30 +710,18 @@ peek :: fn(sock, sid: string, wid := "") ![]string {
 	lines[(if from > 0 do 1 else do 0)..].map(printable)
 }
 
-ask :: fn(
-	prompt: string, input: sync.Chan[string], at: string, pending := "", names: []string = [], args: [string][]string = .[],
-) (line, rest: string) {
-	rest = pending
+ask :: fn(mut input: Input, prompt: string, names: []string = [], args: [string][]string = .[]) (line: string) {
 	loop {
-		out(at + "{prompt}{line}\e[?25h")
-		if rest == "" do rest = input.recv() or return ("", "")
-		loop rest != "" {
-			if rest[0] >= 0x80 {
-				line += rest[..1]
-				rest = rest[1..]
-				continue
-			}
-			parsed, used := keys.key_of(rest)
-			rest = rest[used..]
-			key :: parsed or continue
-			name :: key.names[0]
-			if name == "enter" do return
-			if name in ["esc", "ctrl+c"] do return ("", rest)
-			if name in ["backspace", "ctrl+h"] do line = chop(line)
-			if name == "tab" do line = complete(line, names, args) else do line += key.text
-		}
+		out(bottom + "{prompt}{line}\e[?25h")
+		key :: input.next() or return ""
+		name :: key.names[0]
+		if name == "enter" do return
+		if name in ["esc", "ctrl+c"] do return ""
+		if name in ["backspace", "ctrl+h"] do line = chop(line)
+		if name == "tab" do line = complete(line, names, args) else do line += key.text
 	}
 }
+
 toggle :: fn(items: []string, item: string) []string {
 	if item in items do return items.filter({ $ != item })
 	[..items, item]
@@ -897,7 +917,7 @@ Pane :< {
 		self.holding = held
 		if held && self.since.elapsed() < hold.sec() do return ""
 		self.full = false
-		self.term.draw(self.x, self.y, self.w, self.h, all, dim, cp.marks, cells(cp.needle), link.at, link.reach)
+		self.term.draw(self.x, self.y, self.w, self.h, all, dim = dim, marks = cp.marks, width = cells(cp.needle), link = link.at, reach = link.reach)
 	}
 
 	close :: fn(self) {
@@ -953,8 +973,7 @@ Client :: struct {
 	panes: []Pane
 	pipes: []Pipe
 	chunks: sync.Chan[rex.Chunk]
-	keys: sync.Chan[string]
-	unread: string
+	keys: Input
 	streams, cols, rows, revision, edits, peers: int
 	modes: string
 	owned: bool
@@ -1014,7 +1033,7 @@ Client :< {
 			self.conn = self.conn.reconnect() or {
 				if at.elapsed() > 2.min() do return error("lost the server")
 				sync.select! {
-					got := <-self.keys => {
+					got := <-self.keys.chan => {
 						buf :: got or return error("input closed")
 						parsed, _ := keys.key_of(buf)
 						if "ctrl+c" in (parsed or keys.Key.{}).names do return error("lost the server")
@@ -1047,10 +1066,10 @@ Client :< {
 			}
 			if self.panes.len() == 0 do break
 			sync.select! {
-				got := <-self.keys => {
+				got := <-self.keys.chan => {
 					buf := got or break :run
 					loop self.drag.resizing() {
-						buf += self.keys.try_recv() or break
+						buf += self.keys.chan.try_recv() or break
 					}
 					if self.input(buf)? do break :run
 				},
@@ -1469,8 +1488,7 @@ Client :< {
 	ask :: fn(mut self; prompt: string, names: []string = [], args: [string][]string = .[]) string {
 		out(reset_modes)
 		self.modes = ""
-		line, rest :: ask(prompt, self.keys, "\e[{self.rows};1H\e[0m\e[2K ", self.unread, names, args)
-		self.unread = rest
+		line :: ask(mut self.keys, prompt, names, args)
 		self.redraw()
 		line
 	}
@@ -1736,14 +1754,14 @@ Client :< {
 	input :: fn(mut self; data: string) !bool {
 		if !self.owned do self.own()
 		pass := ""
-		self.unread += data
-		loop self.unread != "" {
-			buf :: self.unread
+		self.keys.unread += data
+		loop self.keys.unread != "" {
+			buf :: self.keys.unread
 			_, fin, seq_len := keys.csi(buf)
 			if buf.starts_with("\e[<") && (fin == 'M' || fin == 'm') {
-				self.unread = buf[seq_len..]
+				self.keys.unread = buf[seq_len..]
 				# a resize is a round trip, only the last motion needs one
-				if self.drag.resizing() && moving(buf) && moving(self.unread) do continue
+				if self.drag.resizing() && moving(buf) && moving(self.keys.unread) do continue
 				pass += self.mouse(buf[..seq_len])?
 				if self.detach do return true
 				continue
@@ -1753,13 +1771,13 @@ Client :< {
 				body :: buf[6..].split("\e[201~")
 				if body.len() < 2 do break
 				used :: body[0].len() + 12
-				self.unread = buf[used..]
+				self.keys.unread = buf[used..]
 				pane :: self.focused() or Pane.{}
 				pass += if pane.painted && pane.term.mode(2004) do buf[..used] else do body[0]
 				continue
 			}
 			parsed, used := keys.key_of(buf)
-			self.unread = buf[used..]
+			self.keys.unread = buf[used..]
 			if self.recording {
 				if self.typed.len() == 0 do self.mark = self.tape.len()
 				self.tape += buf[..used]
@@ -2049,16 +2067,14 @@ Client :< {
 		self.modes = ""
 		on, pick := -1, -1
 		armed := false
-		rest := self.unread
-		self.unread = ""
 		loop {
-			if rest == "" do rest = self.keys.recv() or break
+			if self.keys.unread == "" do self.keys.unread = self.keys.chan.recv() or break
 			at := on
-			if rest.starts_with("\e[<") {
-				_, _, used := keys.csi(rest)
+			if seq :: self.keys.unread; seq.starts_with("\e[<") {
+				_, _, used := keys.csi(seq)
 				if used == 0 do break
-				button, mx, my, up :: sgr(rest[..used])
-				rest = rest[used..]
+				button, mx, my, up :: sgr(seq[..used])
+				self.keys.unread = seq[used..]
 				if button & 64 != 0 do continue
 				i :: my - y0 - 1
 				at = if mx > x0 && mx <= x0 + w && i >= 0 && i < items.len() do i else do -1
@@ -2075,9 +2091,7 @@ Client :< {
 					break
 				}
 			} else {
-				parsed, used := keys.key_of(rest)
-				rest = rest[used..]
-				key :: parsed or break
+				key :: self.keys.next() or break
 				if key.action != "press" do continue
 				if key.names[0] == "down" {
 					at = (on + 1) % items.len()
@@ -2098,7 +2112,6 @@ Client :< {
 				on = at
 			}
 		}
-		self.unread = rest
 		self.redraw()
 		if pick < 0 do return false
 		self.act(items[pick].action, Json.(items[pick].args))
@@ -2114,17 +2127,10 @@ Client :< {
 			frame += "\e[{pane.y + pane.h / 2 + 1};{pane.x + max(pane.w / 2 - 1, 0) + 1}H" + color + " {i + 1} \e[0m"
 		}
 		out(frame + "\e[?25l\e[?2026l")
-		key :: self.next_key()
+		key :: self.keys.next()
 		self.redraw()
 		i :: int.try_from((key or return ()).text) or return ()
 		if i >= 1 && i <= min(self.panes.len(), 9) do self.focus(self.panes[i - 1].bid)?
-	}
-
-	next_key :: fn(mut self) ?keys.Key {
-		if self.unread == "" do self.unread = self.keys.recv() or return none
-		key, used := keys.key_of(self.unread)
-		self.unread = self.unread[used..]
-		key
 	}
 
 	clock :: fn(mut self) {
@@ -2139,19 +2145,17 @@ Client :< {
 			y0, x0 :: pane.y + (pane.h - rows.len()) / 2, pane.x + max(pane.w - cells(rows[0]), 0) / 2
 			loop i in 0..rows.len() do frame += "\e[{y0 + i + 1};{x0 + 1}H\e[34m" + fit(rows[i], pane.w)
 			out(frame + "\e[0m\e[?25l\e[?2026l")
-			got := self.unread
-			if got == "" {
+			if self.keys.unread == "" {
 				sync.select! {
-					data := <-self.keys => {
-						got = data or " "
+					data := <-self.keys.chan => {
+						self.keys.unread = data or " "
 						()
 					},
 					sync.after(1.sec()) => {},
 				}
 			}
-			if got == "" do continue
-			_, used := keys.key_of(got)
-			self.unread = got[used..]
+			if self.keys.unread == "" do continue
+			discard self.keys.next()
 			break
 		}
 		self.redraw()
@@ -2189,7 +2193,7 @@ Client :< {
 		out(frame + "\e[?25l\e[?2026l")
 		typed, pick, shifted := "", -1, false
 		loop {
-			key :: self.next_key() or break
+			key :: self.keys.next() or break
 			if key.action != "press" do continue
 			char :: key.text.lower()
 			if char.len() != 1 || !alphabet.contains(char) do break
@@ -2226,8 +2230,7 @@ Client :< {
 
 	choose :: fn(mut self; title: string, items: []string, preview: ?fn(int) []string = none) int {
 		self.modes = ""
-		i, _, _, rest :: choose(title, items, self.keys, self.unread, preview = preview)
-		self.unread = rest
+		i, _, _ :: choose(mut self.keys, title = title, items = items, preview = preview)
 		self.redraw()
 		i
 	}
@@ -2576,7 +2579,7 @@ Client :< {
 			},
 			"macro.play" => {
 				if self.recording do return error("recording, can't replay")
-				self.unread = self.macro + self.unread
+				self.keys.unread = self.macro + self.keys.unread
 				if self.macro == "" do return error("nothing recorded")
 			},
 			"pane.titles" => {
@@ -2871,7 +2874,7 @@ Client :< {
 		}
 		if "error" !in reply do reply["result"] = :null
 		discard self.conn.call[Ok]("client.reply", reply)?
-		if !detach && self.unread != "" do return self.input("")
+		if !detach && self.keys.unread != "" do return self.input("")
 		detach
 	}
 
