@@ -423,8 +423,10 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 	loop {
 		out("\e[0m\e[H\e[2J" + bottom + "\e[31m{bad}\e[0m")
 		bad = ""
-		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds)
+		tags :: loop j in ..min(sessions.len(), 9) do "{j + 1} "
+		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds, tags, numbered = true)
 		rest = more
+
 		if picked >= 0 do i = picked
 		if name in ["", "esc", "ctrl+c"] {
 			# back to the session it was opened from, if that's still around
@@ -489,26 +491,37 @@ state :: fn() string {
 
 choose :: fn(
 	title: string, items: []string, input: sync.Chan[string], pending: string, at := 0, cmds: [](string, string) = [],
+	tags: []string = [], numbered := false,
 ) (picked: int, name, query, rest: string) {
 	picked, rest = -1, pending
 	size :: tty.size(1) or return
+
 	cols, rows :: int.(size.cols), int.(size.rows)
 	w :: min(cols - 2, 60)
 	shortcuts := [("enter", "pick")]
-	shortcuts << cmds << ("esc", "cancel")
+	shortcuts << cmds
+	if numbered do shortcuts << ("alt+1-9", "goto")
+
+	shortcuts << ("esc", "cancel")
 	foot :: legend(shortcuts, w - 2)
 	visible :: max(min(items.len(), rows - 6 - foot.len()), 1)
 	x, y :: (cols - w - 2) / 2, max((rows - visible - foot.len() - 6) / 2, 0)
+	gutter := 0
+
+	loop tag in tags do gutter = max(gutter, cells(tag))
+
 	i := at
 	loop {
 		picked, name = -1, ""
 		hits: []int = loop item, k in items { if !fuzzy(query, item) do continue; k }
+
 		i = clamp(i, 0, max(hits.len() - 1, 0))
 		off :: max(i - visible + 1, 0)
 		shown: []string = loop k in 0..visible {
 			if k + off < hits.len() {
-				item :: items[hits[k + off]]
-				accent(item, matches(query, item))
+				hit :: hits[k + off]
+				tag :: if hit < tags.len() do tags[hit] else do ""
+				pad(tag, gutter) + accent(items[hit], matches(query, items[hit]))
 			} else do ""
 		}
 		on :: if hits.len() > 0 do i - off else do -1
@@ -527,6 +540,10 @@ choose :: fn(
 		if key.action != "press" do continue
 		name = key.names[0]
 		if name in ["esc", "ctrl+c"] do return
+		if numbered && name.starts_with("alt+") {
+			digit :: int.try_from(name[4..]) or 0
+			if digit >= 1 && digit <= min(items.len(), 9) do return (digit - 1, "enter", query, rest)
+		}
 		if i < hits.len() do picked = hits[i]
 		if name == "enter" || cmds.any({ $.0 == name }) do return
 
@@ -2298,6 +2315,15 @@ Client :< {
 				sessions :: self.conn.call[Sessions]("session.list")?.sessions
 				if !sessions.any({ $.session_id == self.prev }) do return error("no last session")
 				self.next = self.prev
+				return true
+			},
+			"session.goto" => {
+				sessions :: self.conn.call[Sessions]("session.list")?.sessions
+				index :: opts.index or return error("session.goto needs an index")
+				at :: if index < 0 do sessions.len() + index else do index - 1
+				if at < 0 || at >= sessions.len() do return error("no session {index}")
+				if sessions[at].session_id == self.sid do return false
+				self.next = sessions[at].session_id
 				return true
 			},
 			"session.next" => return self.cycle(1)?,

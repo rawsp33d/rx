@@ -13,6 +13,7 @@ pub REQUEST :: r"""{
 		{"name": "session.next", "kind": "client", "title": "next session"},
 		{"name": "session.last", "kind": "client", "title": "last session"},
 		{"name": "session.previous", "kind": "client", "title": "previous session"},
+		{"name": "session.goto", "kind": "client", "title": "go to session", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
 		{"name": "session.select", "kind": "client", "title": "select session", "args": {"type": "object", "properties": {"session_id": {"type": "string"}, "window_id": {"type": "string"}}, "required": ["session_id"]}},
 		{"name": "pane.split", "kind": "client", "title": "split pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
 		{"name": "pane.break", "kind": "client", "title": "break pane to tab"},
