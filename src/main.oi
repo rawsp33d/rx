@@ -420,10 +420,17 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 	bottom :: "\e[999;1H\e[0m\e[2K "
 	cmds :: [("alt+enter", "new"), ("ctrl+w", "warp"), ("ctrl+r", "rename"), ("ctrl+x", "close"), ("alt+up", "move up"), ("alt+down", "move down")]
 	rest := ""
+
 	loop {
 		out("\e[0m\e[H\e[2J" + bottom + "\e[31m{bad}\e[0m")
 		bad = ""
-		tags :: loop j in ..min(sessions.len(), 9) do "{j + 1} "
+		counts :: viewers(sock, sessions)
+		tags: []string = loop session, j in sessions {
+			number :: if j < 9 do "{j + 1}" else do " "
+			here :: if session.label == at do "*" else do " "
+			other :: if counts[j] > 0 do "+" else do " "
+			"{number} {here}{other} "
+		}
 		picked, name, query, more :: choose("Sessions", sessions.map({ $.label }), input, rest, i, cmds, tags, numbered = true)
 		rest = more
 
@@ -482,6 +489,17 @@ pick :: fn(sock: string, sessions: []Session, input: sync.Chan[string], at: stri
 			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
 			i -= 1
 		}
+	}
+}
+
+viewers :: fn(sock: string, sessions: []Session) []int {
+	conn := rex.connect(sock) or return sessions.map({ 0 })
+	defer conn.close()
+
+	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"]) or Sessions.{}
+	loop session in sessions {
+		found :: conn.call[Clients]("session.list_clients", ["session_id" = session.session_id]) or Clients.{}
+		(found.clients or []).len()
 	}
 }
 
