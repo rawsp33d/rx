@@ -42,13 +42,18 @@ pub words :: fn(line: string) []string {
 	out
 }
 
-pub fuzzy :: fn(query, text: string) bool {
+pub matches :: fn(query, text: string) at: []int {
 	want, have :: query.lower(), text.lower()
-	i := 0
-	loop j in 0..have.len() {
-		if i < want.len() && have[j] == want[i] do i += 1
+	loop j in ..have.len() {
+		if at.len() < want.len() && have[j] == want[at.len()] {
+			at << j
+		}
 	}
-	i == want.len()
+	at
+}
+
+pub fuzzy :: fn(query, text: string) bool {
+	matches(query, text).len() == query.len()
 }
 
 test! "chop" {
@@ -57,6 +62,7 @@ test! "chop" {
 
 test! "fuzzy" {
 	assert! fuzzy("zp", "Zoom Pane") && !fuzzy("pz", "Zoom Pane")
+	assert! matches("zp", "Zoom Pane") == [0 5]
 }
 
 test! "complete and words" {

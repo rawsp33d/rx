@@ -16,7 +16,7 @@ use strip
 use keys
 use keymap
 use ghostty
-use prompt.{ complete, chop, value, words, fuzzy }
+use prompt.{ complete, chop, value, words, fuzzy, matches }
 use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift, border }
 use copy.{ Copy, Hit, hits, word }
 use encoding.base64
@@ -506,7 +506,10 @@ choose :: fn(
 		i = clamp(i, 0, max(hits.len() - 1, 0))
 		off :: max(i - visible + 1, 0)
 		shown: []string = loop k in 0..visible {
-			if k + off < hits.len() do items[hits[k + off]] else do ""
+			if k + off < hits.len() {
+				item :: items[hits[k + off]]
+				accent(item, matches(query, item))
+			} else do ""
 		}
 		on :: if hits.len() > 0 do i - off else do -1
 		out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> " + query], foot))
@@ -2846,6 +2849,18 @@ fit :: fn(text: string, width: int) string {
 		esc = esc && char != 'm'
 	}
 	out
+}
+
+accent :: fn(text: string, at: []int) out: string {
+	on := false
+	loop j in ..text.len() {
+		if text[j] & 0xC0 != 0x80 && (j in at) != on {
+			on = !on
+			out += if on do "\e[1;4m" else do "\e[22;24m"
+		}
+		out += text[j..(j + 1)]
+	}
+	if on do out + "\e[22;24m" else do out
 }
 
 cut :: fn(text: string, width: int) string {
