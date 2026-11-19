@@ -119,9 +119,12 @@ cli :: fn(args: []string) ! {
 	readonly, detached, alone :: "-r" in args, "-d" in args, "-D" in args
 	args = args.filter { $ !in ["-r", "-d", "-D"] }
 	cmd = if args.len() > 0 do args[0] else do ""
+	if cmd == "-" && !detached do args, cmd = [last(sock)?], ""
+
 	warp :: cmd in ["w", "warp"]
 	needs_name :: warp || cmd in ["j", "join"]
 	if needs_name || cmd == "run" do args = args[1..]
+
 	label :: if cmd == "run" || args.len() > 0 do named(args) else do "" # "" picks one
 	known :: needs_name || cmd in ["", ".", "run"]
 	nameless :: needs_name && args.len() == 0
@@ -130,22 +133,34 @@ cli :: fn(args: []string) ! {
 		eprint(usage)
 		os.exit(2)
 	}
+
 	if detached && label != "" {
 		dir :: if warp do zoxide(label)? else do os.cwd()
 		if layout != "" {
 			discard create(sock, label, loop win in windows(layout)? do with_cwd(win, dir))?
 			return ()
 		}
+
 		rest := [label, "--cwd", dir]
 		if command.len() > 0 do rest << "--" << command
 		proxy(sock, "new", rest) # like tmux new -d
 	}
+
 	# only a bare . renames, a flag means attach or create
 	inside :: (os.env("REX_SESSION") or "") != ""
 	if cmd == "." && inside && !readonly && !detached && !alone && layout == "" {
 		proxy(sock, "session rename", [label])
 	}
 	run(sock, label, warp, readonly, alone, cmd == "run", command, layout)
+}
+
+last :: fn(sock: string) !string {
+	sid :: fs.read(fs.Path.(state() + "/last")) or ""
+	conn := rex.connect(sock)?
+	defer conn.close()
+	sessions :: conn.call[Sessions]("session.list")?.sessions
+	if !sessions.any({ $.session_id == sid }) do return error("no last session")
+	sid
 }
 
 named :: fn(args: []string) string {
@@ -159,6 +174,7 @@ usage: rx [-S server] [command] [flags] [-- cmd...]
 
 commands:
   (none)               interactive session browser
+  -                    attach the last session, like cd -
   .                    create/join session named after cwd
                        inside a session with no flags, renames it instead
   j, join name         create/join session in current dir

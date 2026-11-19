@@ -44,6 +44,9 @@ just install
 # you can do pretty much everything mentioned below all in one place
 rx
 
+# attach the last session, like `cd -`
+rx -
+
 # create/join session named after cwd
 rx .
 
