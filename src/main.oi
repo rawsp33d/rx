@@ -107,61 +107,54 @@ cli :: fn(args: []string) ! {
 		else => {},
 	}
 	# a command after -- runs in place of a shell
-	command := []string.{}
+	opts := Options.{}
 	sep :: args.index("--") or args.len()
-	if sep < args.len() do command = args[(sep + 1)..]
+	if sep < args.len() do opts.command = args[(sep + 1)..]
 	args = args[0..sep]
-	layout := ""
 	if i := args.index("-l") {
-		if i + 1 < args.len() do layout = args[i + 1]
+		if i + 1 < args.len() do opts.layout = args[i + 1]
 		args = loop arg, k in args { if k == i || k == i + 1 do continue; arg }
 	}
-	readonly, detached, alone :: "-r" in args, "-d" in args, "-D" in args
+	opts.readonly = "-r" in args
+	opts.alone = "-D" in args
+	detached :: "-d" in args
 	args = args.filter { $ !in ["-r", "-d", "-D"] }
 	cmd = if args.len() > 0 do args[0] else do ""
 	if cmd == "-" && !detached do args, cmd = [last(sock)?], ""
 
-	warp :: cmd in ["w", "warp"]
-	needs_name :: warp || cmd in ["j", "join"]
-	if needs_name || cmd == "run" do args = args[1..]
+	opts.warp = cmd in ["w", "warp"]
+	opts.bare = cmd == "run"
+	needs_name :: opts.warp || cmd in ["j", "join"]
+	if needs_name || opts.bare do args = args[1..]
 
-	label :: if cmd == "run" || args.len() > 0 do named(args) else do "" # "" picks one
+	opts.label = if opts.bare || args.len() > 0 do named(args) else do "" # "" picks one
 	known :: needs_name || cmd in ["", ".", "run"]
 	nameless :: needs_name && args.len() == 0
-	stray :: command.len() > 0 && cmd != "run"
-	if !known || nameless || stray || args.len() > 1 || label.starts_with("-") {
+	stray :: opts.command.len() > 0 && !opts.bare
+	if !known || nameless || stray || args.len() > 1 || opts.label.starts_with("-") {
 		eprint(usage)
 		os.exit(2)
 	}
 
-	if detached && label != "" {
-		dir :: if warp do zoxide(label)? else do os.cwd()
-		if layout != "" {
-			discard create(sock, label, loop win in windows(layout)? do with_cwd(win, dir))?
+	if detached && opts.label != "" {
+		dir :: if opts.warp do zoxide(opts.label)? else do os.cwd()
+		if opts.layout != "" {
+			discard create(sock, opts.label, loop win in windows(opts.layout)? do with_cwd(win, dir))?
 			return ()
 		}
 
-		rest := [label, "--cwd", dir]
-		if command.len() > 0 do rest << "--" << command
+		rest := [opts.label, "--cwd", dir]
+		if opts.command.len() > 0 do rest << "--" << opts.command
 		proxy(sock, "new", rest) # like tmux new -d
 	}
 
 	# only a bare . renames, a flag means attach or create
 	inside :: (os.env("REX_SESSION") or "") != ""
-	if cmd == "." && inside && !readonly && !detached && !alone && layout == "" {
-		proxy(sock, "session rename", [label])
+	if cmd == "." && inside && !opts.readonly && !detached && !opts.alone && opts.layout == "" {
+		proxy(sock, "session rename", [opts.label])
 	}
 
-	run(
-		sock,
-		label = label,
-		layout = layout,
-		command = command,
-		warp = warp,
-		readonly = readonly,
-		alone = alone,
-		bare = cmd == "run",
-	)
+	run(sock, opts)
 }
 
 last :: fn(sock: string) !string {
@@ -426,32 +419,33 @@ run :: fn(sock: string, opts: Options) ! {
 
 pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (string, string) {
 	sessions := sessions
-	i := 0
+	list := List.{
+		title = "Sessions"
+		cmds = [
+			("alt+enter" "new")
+			("ctrl+r" "rename")
+			("tab" "mark")
+			("ctrl+x" "close")
+			("alt+up" "move up")
+			("alt+down" "move down")
+		]
+		numbered = true
+	}
 	start :: if at != "" do at else {
 		fs.read(fs.Path.(state() + "/last")) or ""
 	}
-
 	loop session, j in sessions {
-		if start in [session.label, session.session_id] do i = j
+		if start in [session.label session.session_id] do list.at = j
 	}
 
-	bad, search: string
+	bad: string
 	marks: []string
 	previews: [string][]string
-	cmds :: [
-		("alt+enter" "new")
-		("ctrl+r" "rename")
-		("tab" "mark")
-		("ctrl+x" "close")
-		("alt+up" "move up")
-		("alt+down" "move down")
-	]
-
 	loop {
 		out("\e[0m\e[H\e[2J" + bottom + "\e[31m{bad}\e[0m")
 		bad = ""
 		counts :: viewers(sock, sessions)
-		tags: []string = loop session, j in sessions {
+		list.tags = loop session, j in sessions {
 			number :: if j < 9 do "{j + 1}" else do " "
 			here :: if session.label == at do "*" else do " "
 			other :: if counts[j] > 0 do "+" else do " "
@@ -459,6 +453,7 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 			"{number} {here}{other}{mark} "
 		}
 		labels :: sessions.map({ $.label })
+		list.items = labels
 		home :: os.env("HOME") or ""
 
 		# enter takes the dir drawn, zoxide's db can change under it
@@ -479,21 +474,9 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 			previews[sid] or []
 		}
 
-		picked, name, query :: choose(
-			mut input,
-			title = "Sessions",
-			items = labels,
-			tags = tags,
-			cmds = cmds,
-			numbered = true,
-			at = i,
-			query = search,
-			more = rows,
-			preview = look,
-		)
-		search = query
+		picked, name :: list.choose(mut input, rows, look)
+		query :: list.query
 
-		if picked >= 0 do i = picked
 		if name in ["", "esc", "ctrl+c"] {
 			# back to the session it was opened from, if that's still around
 			if name != "" && sessions.any({ $.label == at }) do return (at, "")
@@ -516,7 +499,7 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 
 		if name == "tab" {
 			marks = toggle(marks, id)
-			i = picked + 1
+			list.at += 1
 		}
 
 		if name == "ctrl+r" {
@@ -544,13 +527,13 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 			args: Obj = ["session_id" = id]
 			if picked + 2 < sessions.len() do args["before_session_id"] = sessions[picked + 2].session_id
 			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
-			i += 1
+			list.at += 1
 		}
 
 		if name == "alt+up" && picked > 0 {
 			args: Obj = ["session_id" = id, "before_session_id" = sessions[picked - 1].session_id]
 			sessions = manage(sock, "session.move", args) or { bad = $.message(); continue }
-			i -= 1
+			list.at -= 1
 		}
 	}
 }
@@ -599,80 +582,95 @@ List :: struct {
 	numbered: bool
 	at: int # counts items, not hits
 	query: string
-	more: fn(string) []string = { [] }
-	preview: ?fn(int) []string
 }
 
-choose :: fn(mut input: Input, with list: List) (picked: int, name, query: string) {
-	picked, query = -1, list.query
-	size :: tty.size(1) or return
+List :< {
+	choose :: fn(
+		with mut self; mut input: Input,
+		more: fn(string) []string = { [] },
+		preview: ?fn(int) []string = none,
+	) (picked: int, name: string) {
+		picked = -1
+		size :: tty.size(1) or return
 
-	cols, rows :: int.(size.cols), int.(size.rows)
-	wide :: cols >= 100 && preview != none
-	w :: if wide do 40 else do min(cols - 2, 60)
-	shortcuts := [("enter", "pick")]
-	shortcuts << cmds
-	if numbered do shortcuts << ("alt+1-9", "goto")
+		cols, rows :: int.(size.cols), int.(size.rows)
+		wide :: cols >= 100 && preview != none
+		w :: if wide do 40 else do min(cols - 2, 60)
+		shortcuts := [("enter" "pick")]
+		shortcuts << cmds
+		if numbered do shortcuts << ("alt+1-9" "goto")
 
-	shortcuts << ("esc", "cancel")
-	foot :: legend(shortcuts, w - 2)
-	x, visible := if wide do 0 else do (cols - w - 2) / 2, 1
-	gutter := 0
+		shortcuts << ("esc" "cancel")
+		foot :: legend(shortcuts, w - 2)
+		room :: rows - foot.len() - 6
+		x := if wide do 0 else do (cols - w - 2) / 2
+		gutter, visible := 0, 1
 
-	loop tag in tags do gutter = max(gutter, cells(tag))
+		loop tag in tags do gutter = max(gutter, cells(tag))
 
-	i := items[..min(at, items.len())].filter({ fuzzy(query, $) }).len()
-	loop {
-		picked, name = -1, ""
-		all :: [..items, ..more(query)]
-		hits: []int = loop item, k in all {
-			if k < items.len() && !fuzzy(query, item) do continue
-			k
-		}
-
-		# only grows, a smaller box leaves the old one's edges
-		visible = max(visible, min(if wide do rows else do all.len(), rows - 6 - foot.len()))
-		y :: max((rows - visible - foot.len() - 6) / 2, 0)
-
-		i = clamp(i, 0, max(hits.len() - 1, 0))
-		off :: max(i - visible + 1, 0)
-		shown: []string = loop k in 0..visible {
-			if k + off < hits.len() {
-				hit :: hits[k + off]
-				tag :: if hit < tags.len() do tags[hit] else do ""
-				pad(tag, gutter) + accent(all[hit], matches(query, all[hit]))
-			} else do ""
-		}
-		on :: if hits.len() > 0 do i - off else do -1
-		out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> " + query], foot))
-
-		if look := preview; wide {
-			lines: []string = if on >= 0 && hits[i] < items.len() do look(hits[i]) else do []
-			# as tall as the list box, with its query and rules
-			height :: visible + foot.len() + 3
-			skip :: max(lines.len() - height, 0)
-			tail: []string = loop j in 0..height {
-				if j + skip < lines.len() do lines[j + skip] else do ""
+		i := items[..min(at, items.len())].filter({ fuzzy(self.query, $) }).len()
+		loop {
+			picked, name = -1, ""
+			all :: [..items, ..more(query)]
+			hits: []int = loop item, k in all {
+				if k < items.len() && !fuzzy(query, item) do continue
+				k
 			}
-			out(box(x + w + 2, y, cols - w - 4, "", tail))
-		}
-		out("\e[{y + 2};{x + 5 + cells(query)}H\e[?25h\e[?2026l")
 
-		key :: input.next() or return
-		if key.action != "press" do continue
-		name = key.names[0]
-		if name in ["esc", "ctrl+c"] do return
-		if numbered && name.starts_with("alt+") {
-			digit :: int.try_from(name[4..]) or 0
-			if digit >= 1 && digit <= min(items.len(), 9) do return (digit - 1, "enter", query)
-		}
-		if i < hits.len() do picked = hits[i]
-		if name == "enter" || cmds.any({ $.0 == name }) do return
+			# only grows, a smaller box leaves the old one's edges
+			visible = (if wide do rows else do all.len()) |> min($, room) |> max($, visible)
+			y :: max((room - visible) / 2, 0)
 
-		if name in ["down", "ctrl+n", "tab"] do i += 1
-		if name in ["up", "ctrl+p", "shift+tab"] do i = max(i - 1, 0)
-		if name in ["backspace", "ctrl+h"] do query = chop(query)
-		if key.text != "" && name != "tab" do query, i = query + key.text, 0
+			i = clamp(i, 0, max(hits.len() - 1, 0))
+			off :: max(i - visible + 1, 0)
+			shown: []string = loop k in 0..visible {
+				if k + off < hits.len() {
+					hit :: hits[k + off]
+					tag :: if hit < tags.len() do tags[hit] else do ""
+					pad(tag, gutter) + accent(all[hit], matches(query, all[hit]))
+				} else do ""
+			}
+			on :: if hits.len() > 0 do i - off else do -1
+			out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> {query}"], foot))
+
+			if look := preview; wide {
+				lines: []string = if on >= 0 && hits[i] < items.len() do look(hits[i]) else do []
+				# as tall as the list box, with its query and rules
+				height :: visible + foot.len() + 3
+				skip :: max(lines.len() - height, 0)
+				tail: []string = loop j in 0..height {
+					if j + skip < lines.len() do lines[j + skip] else do ""
+				}
+				out(box(x + w + 2, y, cols - w - 4, "", tail))
+			}
+			out("\e[{y + 2};{x + 5 + cells(query)}H\e[?25h\e[?2026l")
+
+			key :: input.next() or return
+			if key.action != "press" do continue
+			name = key.names[0]
+			if name in ["esc", "ctrl+c"] do return
+			if numbered && name.starts_with("alt+") {
+				digit :: int.try_from(name[4..]) or 0
+				if digit >= 1 && digit <= min(items.len(), 9) {
+					at = digit - 1
+					return (at, "enter")
+				}
+			}
+
+			if i < hits.len() do picked = hits[i]
+			if name == "enter" || cmds.any({ $.0 == name }) {
+				if picked >= 0 do at = picked
+				return
+			}
+
+			if name in ["down" "ctrl+n" "tab"] do i += 1
+			if name in ["up" "ctrl+p" "shift+tab"] do i = max(i - 1, 0)
+			if name in ["backspace" "ctrl+h"] do query = chop(query)
+			if key.text != "" && name != "tab" {
+				query += key.text
+				i = 0
+			}
+		}
 	}
 }
 
@@ -910,14 +908,14 @@ Pane :< {
 		ours
 	}
 
-	draw :: fn(mut self; all, dim: bool, cp: Copy, link: Link) string {
+	draw :: fn(mut self; all: bool, paint: ghostty.Paint) string {
 		if !self.painted do return ""
 		held :: !all && self.term.held()
 		if held && !self.holding do self.since = time.Instant.now()
 		self.holding = held
 		if held && self.since.elapsed() < hold.sec() do return ""
 		self.full = false
-		self.term.draw(self.x, self.y, self.w, self.h, all, dim = dim, marks = cp.marks, width = cells(cp.needle), link = link.at, reach = link.reach)
+		self.term.draw(self.x, self.y, self.w, self.h, all, paint)
 	}
 
 	close :: fn(self) {
@@ -1429,9 +1427,7 @@ Client :< {
 				redraw = all || over && layer > 0
 				if redraw do frame += self.borders(layer)
 			}
-			bid :: self.panes[i].bid
-			link :: if self.link.bid == bid do self.link else do Link.{}
-			drawn :: self.panes[i].draw(redraw, self.dim && bid != self.bid, self.copy_of(bid), link)
+			drawn :: self.panes[i].draw(redraw, self.paint(self.panes[i].bid))
 			if drawn != "" do over = true
 			frame += drawn
 			pane :: self.panes[i]
@@ -1453,6 +1449,16 @@ Client :< {
 		if hints != "" do frame, cursor = frame + hints, "\e[?25l"
 		self.full = false
 		out(frame + cursor + "\e[?2026l")
+	}
+
+	paint :: fn(self; bid: string) ghostty.Paint {
+		cp :: self.copy_of(bid)
+		link :: if self.link.bid == bid do self.link else do Link.{}
+		.{
+			dim = self.dim && bid != self.bid
+			marks = cp.marks, width = cells(cp.needle)
+			link = link.at, reach = link.reach
+		}
 	}
 
 	redraw :: fn(mut self) {
@@ -2230,9 +2236,10 @@ Client :< {
 
 	choose :: fn(mut self; title: string, items: []string, preview: ?fn(int) []string = none) int {
 		self.modes = ""
-		i, _, _ :: choose(mut self.keys, title = title, items = items, preview = preview)
+		list := List.{ title = title, items = items }
+		picked, _ :: list.choose(mut self.keys, preview = preview)
 		self.redraw()
-		i
+		picked
 	}
 
 	count :: fn(mut self; here: string) int {
