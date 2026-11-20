@@ -38,7 +38,7 @@ pub key_of :: fn(buf: string) (?Key, int) {
 			parts :: fields[1].split(":")
 			mods |= (int.try_from(parts[0]) or 1) - 1
 			if parts.len() > 1 {
-				action = match parts[1] { "2" => "repeat", "3" => "release", else => "press" }
+				action = match parts[1] { "2" => "repeat", "3" => "release" } else do "press"
 			}
 		}
 		if fin == 'u' && params != "" && params[0] <= '9' {
@@ -75,17 +75,19 @@ pub key_of :: fn(buf: string) (?Key, int) {
 		names :: ['`' = "backquote", '-' = "minus", '=' = "equal", '[' = "bracket_left", ']' = "bracket_right",
 			'\\' = "backslash", ';' = "semicolon", '\'' = "quote", ',' = "comma", '.' = "period", '/' = "slash",
 			' ' = "space", '\r' = "enter", '\t' = "tab", '\e' = "escape", '\x7f' = "backspace"]
+
 		key = match {
 			code >= 'a' && code <= 'z' => "key_" + rune.(code).str(),
 			code >= '0' && code <= '9' => "digit_" + rune.(code).str(),
-			else => names[rune.(code)] or "",
+		} else {
+			names[rune.(code)] or ""
 		}
 		if key == "" do return (none, used)
+
 		base = match key {
 			"space", "enter", "tab", "backspace" => key,
 			"escape" => "esc",
-			else => rune.(code).str(),
-		}
+		} else do rune.(code).str()
 	}
 
 	ev: Obj = ["key" = key, "unshifted_codepoint" = float.(code), "text" = "", "consumed_mods" = "", "composing" = false, "action" = action]
@@ -113,7 +115,14 @@ private :: fn(code: int) (string, string, int) {
 		57419 = ("up", "up"), 57420 = ("down", "down"), 57421 = ("page_up", "pageup"), 57422 = ("page_down", "pagedown"),
 		57423 = ("home", "home"), 57424 = ("end", "end"), 57425 = ("insert", "insert"), 57426 = ("delete", "delete")]
 	key, base :: keypad[code] or return ("", "", 0)
-	("numpad_" + key, base, match { base.len() == 1 => int.(base[0]), key == "enter" => 13, else => 0 })
+	(
+		"numpad_{key}",
+		base,
+		match {
+			base.len() == 1 => int.(base[0]),
+			key == "enter" => 13,
+		} else do 0
+	)
 }
 
 w3c :: fn(key: string) string {

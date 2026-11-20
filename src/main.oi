@@ -88,6 +88,7 @@ cli :: fn(args: []string) ! {
 		args = args[2..]
 	}
 	autostart(sock)
+
 	cmd := if args.len() > 0 do args[0] else do ""
 	match cmd {
 		"ls" => {
@@ -104,8 +105,8 @@ cli :: fn(args: []string) ! {
 			print(usage)
 			return ()
 		},
-		else => {},
 	}
+
 	# a command after -- runs in place of a shell
 	opts := Options.{}
 	sep :: args.index("--") or args.len()
@@ -1659,18 +1660,21 @@ Client :< {
 
 	tab_name :: fn(self; win: Window) string {
 		if !default_label(win) do return win.label or ""
+
 		bid :: win.focused_block_id or ""
 		cmd, title :: self.fg[bid] or "", printable(self.named[bid] or "")
+
 		# like #{b:pane_current_path}
 		title :: if title.starts_with("/") || title.starts_with("~") {
 			fs.Path.(title).name()
 		} else {
 			title
 		}
+
 		match {
 			title == "" || title == cmd => cmd,
 			cmd == "" => cut(title, 24),
-			else => cmd + ": " + cut(title, 24),
+			_ => cmd + ": " + cut(title, 24),
 		}
 	}
 
@@ -2347,8 +2351,8 @@ Client :< {
 					return report(pane.term, button, clamp(x - pane.x, 0, pane.w - 1), clamp(y - pane.y, 0, pane.h - 1), up)
 				}
 			},
-			else => {},
 		}
+
 		""
 	}
 
@@ -2454,6 +2458,7 @@ Client :< {
 		opts :: json.from_json[keymap.Args](args or { empty }) or keymap.Args.{}
 		dir :: opts.direction or "right"
 		title :: self.titles[name] or { name }
+
 		match name {
 			"detach" => return true,
 			"session.choose" => {
@@ -2767,8 +2772,10 @@ Client :< {
 				if name == "client.mode.exit_all" do self.modes_on = []
 				self.redraw()
 			},
-			else => return error("not_supported: rx has no action {name}"),
+		} else {
+			return error("not_supported: rx has no action {name}")
 		}
+
 		false
 	}
 
@@ -2818,8 +2825,9 @@ Client :< {
 		i :: layouts.index(name) or match name {
 			"next" => (self.layout + 1) % count,
 			"previous" => (self.layout + count - 1) % count,
-			else => return error("no layout {name}"),
+			_ => return error("no layout {name}"),
 		}
+
 		self.layout = i
 		self.arrange(self.tiled(), layouts[i])?
 		self.say(layouts[i])
@@ -2899,12 +2907,14 @@ Client :< {
 		across :: dir == "left" || dir == "right"
 		loop pane in self.panes {
 			if pane.layer != focus.layer || pane.bid == focus.bid do continue
+
 			touches :: match dir {
 				"left" => pane.x + pane.w + 1 == focus.x,
 				"right" => focus.x + focus.w + 1 == pane.x,
 				"up" => pane.y + pane.h + 1 == focus.y,
-				else => focus.y + focus.h + 1 == pane.y,
+				_ => focus.y + focus.h + 1 == pane.y,
 			}
+
 			overlaps :: if across {
 				pane.y < focus.y + focus.h && focus.y < pane.y + pane.h
 			} else {

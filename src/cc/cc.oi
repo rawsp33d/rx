@@ -284,8 +284,7 @@ Cc :< {
 				self.ok("session.focus_block", ["block_id" = target])?
 				""
 			},
-			else => return error("unknown command: {cmd}"),
-		}
+		} else do return error("unknown command: {cmd}")
 	}
 
 	window_vars :: fn(mut self; i: int) [string]string {
