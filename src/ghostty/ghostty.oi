@@ -1,4 +1,5 @@
 use libc
+use encoding.base64
 
 @link.{"../.deps/ghostty-vt/lib/libghostty-vt.so"}
 ghostty_snapshot_decoder_new_buf : fn(alloc: ptr, out: ptr, p: ptr, n: usize) i32 : foreign
@@ -40,6 +41,7 @@ ghostty_search_free : fn(search: ptr) : foreign
 ghostty_search_run : fn(search: ptr) i32 : foreign
 ghostty_search_set : fn(search: ptr, opt: i32, value: ptr) i32 : foreign
 ghostty_search_get : fn(search: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_color_parse : fn(p: ptr, n: usize, out: ptr) i32 : foreign
 
 @c Viewport :: struct { tag: i32, delta: int, pad: u64 }
 
@@ -70,6 +72,16 @@ check :: fn(code: i32, what: string) ! {
 	if code != 0 do return error("ghostty: {what} failed ({code})")
 }
 
+# a 1x1 kitty image of an OSC color at opacity, black if it doesn't parse
+pub image :: fn(id: int, color: string, opacity: float) string {
+	pixel :: unsafe libc.malloc(4)
+	defer unsafe libc.free(pixel)
+	unsafe pixel.write(u32.(0))
+	discard unsafe ghostty_color_parse(color.ptr, usize.(color.len()), pixel)
+	unsafe pixel.offset(3).write(u8.(int.(opacity * 255.0)))
+	"\e_Ga=t,f=32,s=1,v=1,i={id},q=2;{base64.encode(unsafe pixel.string(4))}\e\\"
+}
+
 pub blank :: fn(cols, rows: int) !Term {
 	out :: unsafe libc.malloc(8)
 	defer unsafe libc.free(out)
@@ -80,6 +92,8 @@ pub blank :: fn(cols, rows: int) !Term {
 @params
 pub Paint :: struct {
 	pub dim: bool
+	## kitty image over the blanks ending each row, which show what's underneath
+	pub tint: int
 	pub marks: []int
 	pub width: int
 	pub link: int = -1
@@ -136,6 +150,12 @@ Term :< {
 		unsafe self.buf.read[u8]() == 0
 	}
 
+	pub dirty :: fn(self) bool {
+		discard unsafe ghostty_render_state_update(self.state, self.term)
+		discard unsafe ghostty_render_state_get(self.state, 3, self.buf) # DIRTY
+		unsafe self.buf.read[i32]() != 0
+	}
+
 	# TODO: highlight where a match wraps onto the next row
 	pub draw :: fn(self; x, y, w, h: int, all: bool, with paint: Paint) string {
 		top, _, _ :: self.viewport()
@@ -179,7 +199,9 @@ Term :< {
 			under :: if paint.link >= 0 && paint.link / cols == top + row {
 				paint.link % cols
 			} else do -1
-			sgr, col := "", 0
+
+			sgr := ""
+			col, skip: int
 			loop col < w {
 				more :: unsafe ghostty_render_state_row_cells_next(self.cells)
 				if !more do break
@@ -206,13 +228,26 @@ Term :< {
 					style = style[..(style.len() - 1)] + ";4m"
 				}
 				if dim do style = style[..(style.len() - 1)] + ";2m"
+				glyph :: self.text()
+				if tint > 0 && style == "\e[0m" && (glyph == "" || glyph == " ") {
+					skip, col = skip + 1, col + 1
+					continue
+				}
+
+				if skip > 0 {
+					out.write("\e[0m\e[{skip}X\e[{skip}C")
+					sgr, skip = "\e[0m", 0
+				}
 				if style != sgr {
 					out.write(style)
 					sgr = style
 				}
-				glyph :: self.text()
 				out.write(if glyph == "" do " " else do glyph)
 				col += if wide == 1 do 2 else do 1
+			}
+
+			if skip > 0 {
+				out.write("\e[{y + row + 1};{x + col - skip + 1}H\e_Ga=p,i={tint},p={row + 1},c={skip},r=1,z=1,C=1,q=2\e\\")
 			}
 		}
 

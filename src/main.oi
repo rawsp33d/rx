@@ -398,6 +398,7 @@ run :: fn(sock: string, opts: Options) ! {
 			chunks = sync.Chan[rex.Chunk].{}, keys = input,
 		}
 		client.load_keymap()?
+		out("\e]11;?\e\\")
 		# like tmux attach -d
 		if opts.alone {
 			loop peer in client.others()? do client.kick(peer) or {}
@@ -992,6 +993,8 @@ Client :: struct {
 	msg_at: time.Instant
 	bad: bool
 	fg, named, labels: [string]string
+	opacities: [string]float # by scratch label
+	bg: string # OSC 11
 	status: [string]string # OSC 7501, by block id, newline, record id
 	seen: [string]()
 	layout: int
@@ -1412,6 +1415,8 @@ Client :< {
 		if hints != self.hinted do all = true
 		self.hinted = hints
 		frame := "\e[?2026h"
+		# see-through blanks don't erase, so what's under them repaints too
+		if self.panes.any({ $.painted && self.opacity($.bid) < 1.0 && $.term.dirty() }) do all = true
 		if all do frame += "\e[0m\e[H\e[2J"
 		bar :: self.bar()
 		if !self.bare && (all || bar != self.shown) {
@@ -1427,7 +1432,15 @@ Client :< {
 				redraw = all || over && layer > 0
 				if redraw do frame += self.borders(layer)
 			}
-			drawn :: self.panes[i].draw(redraw, self.paint(self.panes[i].bid))
+
+			paint := self.paint(self.panes[i].bid)
+			opacity :: self.opacity(self.panes[i].bid)
+			if opacity < 1.0 {
+				paint.tint = self.panes[i].id + 1
+				if redraw do frame += ghostty.image(paint.tint, self.bg, opacity)
+			}
+			drawn :: self.panes[i].draw(redraw, paint)
+
 			if drawn != "" do over = true
 			frame += drawn
 			pane :: self.panes[i]
@@ -1459,6 +1472,15 @@ Client :< {
 			marks = cp.marks, width = cells(cp.needle)
 			link = link.at, reach = link.reach
 		}
+	}
+
+	opacity :: fn(self; bid: string) float {
+		loop layer in self.win().layers; block in layer.blocks or [] {
+			if block.block_id == bid {
+				return self.opacities[block.label or ""] or 1.0
+			}
+		}
+		1.0
 	}
 
 	redraw :: fn(mut self) {
@@ -1513,8 +1535,10 @@ Client :< {
 		focus := Pane.{ x = -2, y = -2 }
 		edge: [int]() = .[]
 		buf := Buffer.{}
+
 		loop pane in self.panes {
 			if pane.layer != layer do continue
+
 			if pane.bid == self.bid do focus = pane
 			right, below :: pane.x + pane.w, pane.y + pane.h
 			if right < area.x + area.w {
@@ -1524,9 +1548,13 @@ Client :< {
 				loop x in pane.x..min(right + 1, area.x + area.w) do edge[below * cols + x] = ()
 			}
 		}
+
 		if layer > 0 {
+			solid :: self.panes.all({ $.layer != layer || self.opacity($.bid) == 1.0 })
 			loop y in area.y..(area.y + area.h) {
-				buf.write("\e[{y + 1};{area.x + 1}H\e[0m\e[{area.w}X")
+				if solid {
+					buf.write("\e[{y + 1};{area.x + 1}H\e[0m\e[{area.w}X")
+				}
 				edge[y * cols + area.x - 1] = ()
 				edge[y * cols + area.x + area.w] = ()
 			}
@@ -1535,21 +1563,26 @@ Client :< {
 				edge[(area.y + area.h) * cols + x] = ()
 			}
 		}
+
 		lines :: " │││─┘┐┤─└┌├─┴┬┼".runes() # 1 up, 2 down, 4 left, 8 right
 		loop at in edge.keys {
 			x, y :: at % cols, at / cols
 			joins := 0
+
 			if (at - cols) in edge do joins |= 1
 			if (at + cols) in edge do joins |= 2
 			if x > 0 && (at - 1) in edge do joins |= 4
 			if x + 1 < cols && (at + 1) in edge do joins |= 8
+
 			near :: x >= focus.x - 1 && x <= focus.x + focus.w && y >= focus.y - 1 && y <= focus.y + focus.h
 			buf.write("\e[{y + 1};{x + 1}H" + (if near do "\e[32m" else do "\e[39m") + lines[joins].str())
 		}
+
 		loop pane in self.panes {
 			if !self.frames do break
 			title :: self.pane_title(pane) + marks[urgency(self.state(pane.bid))]
 			if pane.layer != layer || title == "" || pane.w < 5 do continue
+
 			color :: if pane.bid == self.bid do "\e[1;32m" else do "\e[0;39m"
 			buf.write("\e[{pane.y + pane.h + 1};{pane.x + 2}H" + color + " " + fit(printable(title), pane.w - 4) + " \e[0m")
 		}
@@ -1772,6 +1805,15 @@ Client :< {
 				if self.detach do return true
 				continue
 			}
+
+			if buf.starts_with("\e]11;") {
+				body :: buf[5..].split("\e\\")
+				if body.len() < 2 do break
+				self.bg = body[0]
+				self.keys.unread = buf[(body[0].len() + 7)..]
+				continue
+			}
+
 			if buf.starts_with("\e[200~") {
 				# a paste skips the keymap, or its newlines would be ctrl+j
 				body :: buf[6..].split("\e[201~")
@@ -1782,6 +1824,7 @@ Client :< {
 				pass += if pane.painted && pane.term.mode(2004) do buf[..used] else do body[0]
 				continue
 			}
+
 			parsed, used := keys.key_of(buf)
 			self.keys.unread = buf[used..]
 			if self.recording {
@@ -1792,12 +1835,14 @@ Client :< {
 				pass += buf[..used]
 				continue
 			}
+
 			if key.action != "press" {
 				if key.code in self.eaten {
 					if key.action == "release" do self.eaten = self.eaten.filter({ $ != key.code })
 				} else do pass += buf[..used]
 				continue
 			}
+
 			typed := self.typed
 			typed << key.names
 			hit, drop := keymap.resolve(self.km, typed, self.can, self.modes_on.last() or "")
@@ -1808,17 +1853,20 @@ Client :< {
 				self.typed = []
 				continue
 			}
+
 			self.eat(key)
 			if hit.keys.len() > typed.len() {
 				self.typed = typed
 				continue
 			}
+
 			self.typed = []
 			if self.recording && hit.action.starts_with("macro.") do self.tape = self.tape[..self.mark]
 			self.write(pass)?
 			pass = ""
 			if self.perform(hit, key) or { self.say($.message(), true); false } do return true
 		}
+
 		self.write(pass)?
 		if self.bar() != self.shown || self.which() != self.hinted do self.draw()
 		false
@@ -2624,8 +2672,8 @@ Client :< {
 				self.ok("session.set_layer_state", ["layer_id" = id, "state" = "normal", "focus" = true])?
 			},
 			"layer.new" => self.pop(opts.command or "")?,
-			"layer.scratch" => self.scratch("scratch", self.view.windows or [])?,
-			"layer.scratch_tab" => self.scratch("tab scratch", [self.win()])?,
+			"layer.scratch" => self.scratch("scratch", self.view.windows or [], opts.opacity or 1.0)?,
+			"layer.scratch_tab" => self.scratch("tab scratch", [self.win()], opts.opacity or 1.0)?,
 			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
 			"pane.last" => self.focus(self.last_bid[self.wid] or return error("no last pane"))?,
 			"pane.next" => self.ok("session.focus_next_pane", ["wrap" = true])?,
@@ -2733,7 +2781,12 @@ Client :< {
 		self.ok("session.new_layer", ["bounds" = popup(), "layout" = rex.shell(self.here(), opts), "focus" = true])?
 	}
 
-	scratch :: fn(mut self; label: string, wins: []Window) ! {
+	scratch :: fn(mut self; label: string, wins: []Window, opacity: float) ! {
+		# can't index assign a field's map
+		opacities := self.opacities
+		opacities[label] = opacity
+		self.opacities = opacities
+
 		loop win in wins; layer in win.layers {
 			blocks :: layer.blocks or []
 			block :: blocks.find({ ($.label or "") == label }) or continue

@@ -57,8 +57,8 @@ pub REQUEST :: r"""{
 		{"name": "layer.restore", "kind": "client", "title": "restore minimized layer"},
 		{"name": "layer.close", "kind": "client", "title": "close layer"},
 		{"name": "layer.toggle_all", "kind": "client", "title": "toggle layers"},
-		{"name": "layer.scratch", "kind": "client", "title": "toggle scratch float"},
-		{"name": "layer.scratch_tab", "kind": "client", "title": "toggle tab scratch float"},
+		{"name": "layer.scratch", "kind": "client", "title": "toggle scratch float", "args": {"type": "object", "properties": {"opacity": {"type": "number", "minimum": 0, "maximum": 1}}}},
+		{"name": "layer.scratch_tab", "kind": "client", "title": "toggle tab scratch float", "args": {"type": "object", "properties": {"opacity": {"type": "number", "minimum": 0, "maximum": 1}}}},
 		{"name": "tab.new", "kind": "client", "title": "new tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
 		{"name": "tab.next", "kind": "client", "title": "next tab"},
 		{"name": "tab.previous", "kind": "client", "title": "previous tab"},
@@ -79,15 +79,53 @@ pub REQUEST :: r"""{
 	]
 }"""
 
-pub Binding :: struct { pub keys: []string, pub action: string, pub args: ?json.Json, pub mode: ?string }
-pub Action :: struct { pub name: string, pub title: ?string, pub args: ?Schema }
-pub Schema :: struct { pub required: ?[]string, pub properties: ?json.Json }
-pub Config :: struct { pub hash: string }
-pub Mode :: struct { pub name: string, pub exclusive: bool, pub blocked: ?[][]string }
+pub Binding :: struct {
+	pub keys: []string,
+	pub action: string,
+	pub args: ?json.Json,
+	pub mode: ?string,
+}
 
-pub Args :: struct { pub direction: ?string, pub name: ?string, pub cells: ?int, pub side: ?string, pub command: ?string, pub layout: ?string, pub index: ?int, pub session_id: ?string, pub window_id: ?string }
+pub Action :: struct {
+	pub name: string,
+	pub title: ?string,
+	pub args: ?Schema,
+}
 
-pub Keymap :: struct { pub bindings: []Binding, pub actions: ?[]Action, pub modes: ?[]Mode, pub config: Config }
+pub Schema :: struct {
+	pub required: ?[]string,
+	pub properties: ?json.Json,
+}
+
+pub Config :: struct {
+	pub hash: string,
+}
+
+pub Mode :: struct {
+	pub name: string,
+	pub exclusive: bool,
+	pub blocked: ?[][]string,
+}
+
+pub Args :: struct {
+	pub direction: ?string,
+	pub name: ?string,
+	pub cells: ?int,
+	pub side: ?string,
+	pub command: ?string,
+	pub layout: ?string,
+	pub index: ?int,
+	pub session_id: ?string,
+	pub window_id: ?string,
+	pub opacity: ?float,
+}
+
+pub Keymap :: struct {
+	pub bindings: []Binding,
+	pub actions: ?[]Action,
+	pub modes: ?[]Mode,
+	pub config: Config,
+}
 
 Request :: struct { pub actions: []Action }
 
