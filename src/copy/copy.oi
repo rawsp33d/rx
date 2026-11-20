@@ -1,5 +1,6 @@
 use math.{ min, max, clamp }
 use ghostty
+use regex
 
 # rows count from the top of history
 pub Copy :: struct {
@@ -166,14 +167,29 @@ pub hits :: fn(term: ghostty.Term, y: int) []Hit {
 		loop 0..char.len() do at << x
 		line += char
 	}
+
+	# ghostty's url pattern, its lookbehinds done by hand since Oi doesn't support them (yet)
+	# REF: https://github.com/ghostty-org/ghostty/blob/main/src/config/url.zig
+	links :: regex.compile(
+		r"(?:https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:)" +
+		r"(?:\[[:0-9a-fA-F]+\](?::[0-9]+)?|[\w\-.~:/?#@!$&*+,;=%]+(?:[(\[]\w*[)\]])?)+",
+	) or panic!($.message())
+
 	out := []Hit.{}
 	i := 0
 	loop i < line.len() {
 		j := i
 		loop j < line.len() && line[j] != ' ' do j += 1
+
 		from, to := i, j
-		loop from < to && "([{{<'\"`".contains(line[from..(from + 1)]) do from += 1
-		loop to > from && ")]}}>'\"`.,:;!?".contains(line[(to - 1)..to]) do to -= 1
+		if url := links.find(line[i..j]) {
+			from, to = i + url.0, i + url.1
+			loop to > from && ".,".contains(line[(to - 1)..to]) do to -= 1
+		} else {
+			loop from < to && "([{{<'\"`".contains(line[from..(from + 1)]) do from += 1
+			loop to > from && ")]}}>'\"`.,:;!?".contains(line[(to - 1)..to]) do to -= 1
+		}
+
 		text :: line[from..to]
 		if worth(text) do out << Hit.{ text = text, x = at[from], y = y }
 		i = j + 1
