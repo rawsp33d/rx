@@ -411,7 +411,8 @@ run :: fn(sock: string, opts: Options) ! {
 			return $
 		}
 		client.close()
-		conn, input = client.conn, client.keys
+		conn = client.conn
+		input = client.keys
 		if !client.choose && client.next == "" do break
 		choose = client.next == ""
 		label, dir = if client.next != "" do (client.next, client.dir) else do (label, "")
@@ -2583,7 +2584,9 @@ Client :< {
 				i :: self.choose(title, loop peer in peers do describe(peer))
 				if i >= 0 do self.kick(peers[i])?
 			},
-			"client.detach_others" => loop peer in self.others()? do self.kick(peer)?,
+			"client.detach_others" => {
+				loop peer in self.others()? do self.kick(peer) or {}
+			},
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
 			"client.prompt" => {
 				typed :: words(self.ask(": ", self.can.keys, self.arg_words))
