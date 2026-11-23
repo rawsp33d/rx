@@ -1,6 +1,6 @@
-use libc
 use encoding.base64
-use math.{ max }
+use libc
+use math
 
 @link.{"../.deps/ghostty-vt/lib/libghostty-vt.so"}
 ghostty_snapshot_decoder_new_buf : fn(alloc: ptr, out: ptr, p: ptr, n: usize) i32 : foreign
@@ -28,6 +28,12 @@ ghostty_render_state_row_cells_new : fn(alloc: ptr, out: ptr) i32 : foreign
 ghostty_render_state_row_cells_next : fn(cells: ptr) bool : foreign
 ghostty_render_state_row_cells_get : fn(cells: ptr, data: i32, out: ptr) i32 : foreign
 ghostty_render_state_row_cells_free : fn(cells: ptr) : foreign
+ghostty_render_state_image_iterator_new : fn(alloc: ptr, out: ptr) i32 : foreign
+ghostty_render_state_image_iterator_next : fn(images: ptr) bool : foreign
+ghostty_render_state_image_iterator_free : fn(images: ptr) : foreign
+ghostty_render_state_image_get : fn(images: ptr, data: i32, out: ptr) i32 : foreign
+ghostty_kitty_graphics_image : fn(graphics: ptr, id: u32) ptr : foreign
+ghostty_kitty_graphics_image_get : fn(image: ptr, data: i32, out: ptr) i32 : foreign
 ghostty_cell_get : fn(cell: u64, data: i32, out: ptr) i32 : foreign
 ghostty_free : fn(alloc: ptr, p: ptr, n: usize) : foreign
 ghostty_terminal_set : fn(term: ptr, opt: i32, value: ptr) i32 : foreign
@@ -101,8 +107,14 @@ pub Paint :: struct {
 	pub reach: int
 }
 
+# x and y are pixels into its top left cell
+pub Image :: struct {
+	pub id, generation: int
+	z, col, row, x, y, width, height, src_x, src_y, src_w, src_h: int
+}
+
 pub Term :: struct {
-	term, state, rows, cells: ptr
+	term, state, rows, cells, images: ptr
 	buf: ptr
 }
 
@@ -120,11 +132,15 @@ Term :< {
 		discard unsafe ghostty_render_state_row_iterator_new(null, buf)
 		rows :: unsafe buf.read[ptr]()
 		discard unsafe ghostty_render_state_row_cells_new(null, buf)
+		cells :: unsafe buf.read[ptr]()
+		discard unsafe ghostty_render_state_image_iterator_new(null, buf)
+
 		Self.{
 			term = term,
 			state = state,
 			rows = rows,
-			cells = unsafe buf.read[ptr](),
+			cells = cells,
+			images = unsafe buf.read[ptr](),
 			buf = buf,
 		}
 	}
@@ -132,6 +148,7 @@ Term :< {
 	pub free :: fn(self) {
 		unsafe ghostty_render_state_row_cells_free(self.cells)
 		unsafe ghostty_render_state_row_iterator_free(self.rows)
+		unsafe ghostty_render_state_image_iterator_free(self.images)
 		unsafe ghostty_render_state_free(self.state)
 		unsafe ghostty_terminal_free(self.term)
 		unsafe libc.free(self.buf)
@@ -158,8 +175,9 @@ Term :< {
 		loop (at, data) in [(0, 1), (2, 2), (4, 16), (8, 17)] { # COLS, ROWS, WIDTH_PX, HEIGHT_PX
 			discard unsafe ghostty_terminal_get(self.term, i32.(data), buf.offset(at))
 		}
-		width = int.(unsafe buf.offset(4).read[u32]()) / max(1, int.(unsafe buf.read[u16]()))
-		height = int.(unsafe buf.offset(8).read[u32]()) / max(1, int.(unsafe buf.offset(2).read[u16]()))
+
+		width = int.(unsafe buf.offset(4).read[u32]()) / math.max(1, int.(unsafe buf.read[u16]()))
+		height = int.(unsafe buf.offset(8).read[u32]()) / math.max(1, int.(unsafe buf.offset(2).read[u16]()))
 		return
 	}
 
@@ -339,6 +357,83 @@ Term :< {
 		# DECSCUSR steady shapes for bar, block, underline, hollow block, one less to blink
 		shape :: [6, 2, 4, 2][style % 4] - if blink do 1 else do 0
 		("\e[{shape} q\e[{y + cy + 1};{x + cx + 1}H\e[?25h", x + cx, y + cy)
+	}
+
+	# changes with the placements
+	pub placed :: fn(self) int {
+		discard unsafe ghostty_render_state_get(self.state, 23, self.buf) # IMAGE_PLACEMENTS_GENERATION
+		int.(unsafe self.buf.read[u64]())
+	}
+
+	pub placements :: fn(self) []Image {
+		unsafe self.buf.write(self.images)
+		discard unsafe ghostty_render_state_get(self.state, 22, self.buf) # IMAGE_ITERATOR
+		loop (unsafe ghostty_render_state_image_iterator_next(self.images)) {
+			Image.{
+				id = self.field(2), generation = self.field(3), z = self.field(5),
+				col = self.field(6), row = self.field(7), x = self.field(10), y = self.field(11),
+				width = self.field(12), height = self.field(13),
+				src_x = self.field(14), src_y = self.field(15), src_w = self.field(16), src_h = self.field(17),
+			}
+		}
+	}
+
+	# ids past 2^31 come back negative, u32 wraps them back
+	field :: fn(self; data: int) int {
+		unsafe self.buf.write(i32.(0))
+		discard unsafe ghostty_render_state_image_get(self.images, i32.(data), self.buf)
+		int.(unsafe self.buf.read[i32]())
+	}
+
+	# an image's pixels, sent on to the outer terminal under a new id
+	pub upload :: fn(self; id, outer: int) string {
+		buf :: self.buf
+		discard unsafe ghostty_terminal_get(self.term, 30, buf) # KITTY_GRAPHICS
+		image :: unsafe ghostty_kitty_graphics_image(unsafe buf.read[ptr](), u32.(id))
+		if image.is_null() do return ""
+		loop (at, data) in [(0, 3), (4, 4), (8, 5), (16, 7), (24, 8)] { # WIDTH, HEIGHT, FORMAT, DATA_PTR, DATA_LEN
+			if unsafe ghostty_kitty_graphics_image_get(image, i32.(data), buf.offset(at)) != 0 do return ""
+		}
+
+		format :: unsafe buf.offset(8).read[i32]()
+		if format > 1 do return "" # gray only comes from png
+
+		start, len :: unsafe buf.offset(16).read[ptr](), unsafe buf.offset(24).read[usize]()
+		data :: base64.encode(unsafe start.string(int.(len)))
+		out := Buffer.{}
+		out.write("\e_Ga=t,f={24 + format * 8},s={unsafe buf.read[u32]()},v={unsafe buf.offset(4).read[u32]()},i={outer},q=2")
+
+		loop at in 0..4096..data.len() {
+			if at > 0 do out.write("\e_Gq=2")
+			end :: math.min(at + 4096, data.len())
+			out.write(",m={if end < data.len() do 1 else do 0};{data[at..end]}\e\\")
+		}
+
+		out.str()
+	}
+
+	# clipped to the pane at x, y
+	pub place :: fn(self; image: Image, outer: int, x, y, w, h: int) string {
+		width, height :: self.cell()
+		if width == 0 || height == 0 do return ""
+
+		left, top :: image.col * width + image.x, image.row * height + image.y
+		x0, y0 :: math.max(left, 0), math.max(top, 0)
+		x1, y1 :: math.min(left + image.width, w * width), math.min(top + image.height, h * height)
+		if x1 <= x0 || y1 <= y0 do return ""
+
+		src_x :: image.src_x + (x0 - left) * image.src_w / image.width
+		src_y :: image.src_y + (y0 - top) * image.src_h / image.height
+		src_w :: math.max(1, (x1 - x0) * image.src_w / image.width)
+		src_h :: math.max(1, (y1 - y0) * image.src_h / image.height)
+		off_x, off_y :: x0 % width, y0 % height
+		seq := "\e[{y + y0 / height + 1};{x + x0 / width + 1}H\e_Ga=p,i={outer},x={src_x},y={src_y},w={src_w},h={src_h},X={off_x},Y={off_y},z={image.z},C=1,q=2"
+
+		# kitty stretches a scaled image over whole cells
+		if image.src_w != image.width || image.src_h != image.height {
+			seq += ",c={(off_x + x1 - x0 + width - 1) / width},r={(off_y + y1 - y0 + height - 1) / height}"
+		}
+		seq + "\e\\"
 	}
 
 	pub title :: fn(self) string {

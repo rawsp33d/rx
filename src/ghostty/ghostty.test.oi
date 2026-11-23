@@ -1,4 +1,5 @@
 use libc
+use encoding.base64
 
 test! "draw" {
 	null :: ptr.(0)
@@ -50,4 +51,27 @@ test! "draw" {
 	defer wide.free()
 	loop 0..300 do wide.write("x")
 	assert! wide.draw(0, 0, 300, 1, true).len() == 314
+}
+
+test! "images" {
+	term :: blank(10, 4) or panic!($.message())
+	defer term.free()
+
+	term.fit(10, 20)
+	pixels := ""
+	loop 0..1600 do pixels += "abcd"
+	term.write("\e[2;3H\e_Ga=T,f=32,s=40,v=40,i=7,q=2;{base64.encode(pixels)}\e\\")
+	discard term.draw(0, 0, 10, 4, true)
+
+	image :: term.placements()[0]
+	sent :: term.upload(image.id, 99)
+	assert! sent.starts_with("\e_Ga=t,f=32,s=40,v=40,i=99,q=2,m=1;") && sent.split("\e_G").len() == 4
+
+	# cut by the pane's right and bottom edges
+	assert! term.place(image, 99, 3, 1, 5, 2) == "\e[3;6H\e_Ga=p,i=99,x=0,y=0,w=30,h=20,X=0,Y=0,z=0,C=1,q=2\e\\"
+	term.write("\e[4;1H\r\n\r\n")
+	discard term.draw(0, 0, 10, 4, false)
+
+	# and its top row scrolled off
+	assert! term.place(term.placements()[0], 99, 0, 0, 10, 4) == "\e[1;3H\e_Ga=p,i=99,x=0,y=20,w=40,h=20,X=0,Y=0,z=0,C=1,q=2\e\\"
 }
