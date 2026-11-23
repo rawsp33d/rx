@@ -1,5 +1,6 @@
 use libc
 use encoding.base64
+use math.{ max }
 
 @link.{"../.deps/ghostty-vt/lib/libghostty-vt.so"}
 ghostty_snapshot_decoder_new_buf : fn(alloc: ptr, out: ptr, p: ptr, n: usize) i32 : foreign
@@ -109,6 +110,11 @@ Term :< {
 	new :: fn(term: ptr) Self {
 		null :: ptr.(0)
 		buf :: unsafe libc.malloc(256)
+
+		# TODO: png (f=100) needs a decoder set with ghostty_sys_set
+		unsafe buf.write(u64.(320 << 20)) # kitty's default
+
+		discard unsafe ghostty_terminal_set(term, 15, buf) # KITTY_IMAGE_STORAGE_LIMIT
 		discard unsafe ghostty_render_state_new(null, buf)
 		state :: unsafe buf.read[ptr]()
 		discard unsafe ghostty_render_state_row_iterator_new(null, buf)
@@ -136,7 +142,25 @@ Term :< {
 	}
 
 	pub resize :: fn(self; cols, rows: int) {
-		discard unsafe ghostty_terminal_resize(self.term, u16.(cols), u16.(rows), 1, 1)
+		width, height :: self.cell()
+		discard unsafe ghostty_terminal_resize(self.term, u16.(cols), u16.(rows), u32.(width), u32.(height))
+	}
+
+	# The outer terminal's cell size in pixels.
+	pub fit :: fn(self; width, height: int) {
+		if self.cell() == (width, height) do return
+		_, rows, _ :: self.viewport()
+		discard unsafe ghostty_terminal_resize(self.term, u16.(self.cols()), u16.(rows), u32.(width), u32.(height))
+	}
+
+	cell :: fn(self) (width: int, height: int) {
+		buf :: self.buf
+		loop (at, data) in [(0, 1), (2, 2), (4, 16), (8, 17)] { # COLS, ROWS, WIDTH_PX, HEIGHT_PX
+			discard unsafe ghostty_terminal_get(self.term, i32.(data), buf.offset(at))
+		}
+		width = int.(unsafe buf.offset(4).read[u32]()) / max(1, int.(unsafe buf.read[u16]()))
+		height = int.(unsafe buf.offset(8).read[u32]()) / max(1, int.(unsafe buf.offset(2).read[u16]()))
+		return
 	}
 
 	pub scroll :: fn(self; delta: int) bool {

@@ -976,6 +976,7 @@ Client :: struct {
 	chunks: sync.Chan[rex.Chunk]
 	keys: Input
 	streams, cols, rows, revision, edits, peers: int
+	cell_w, cell_h: int # in pixels, zero if the terminal doesn't report
 	modes: string
 	owned: bool
 	full, readonly, bare, mouse_off, dim, recording: bool
@@ -1225,6 +1226,8 @@ Client :< {
 		size :: tty.size(1)?
 		self.cols = int.(size.cols)
 		self.rows = int.(size.rows)
+		self.cell_w = int.(size.xpixel) / max(self.cols, 1)
+		self.cell_h = int.(size.ypixel) / max(self.rows, 1)
 		h :: self.rows - if self.bare do 0 else do 1
 		win :: self.win()
 		bid :: win.focused_block_id or ""
@@ -1441,6 +1444,7 @@ Client :< {
 				paint.tint = self.panes[i].id + 1
 				if redraw do frame += ghostty.image(paint.tint, self.bg, opacity)
 			}
+			if self.panes[i].painted do self.panes[i].term.fit(self.cell_w, self.cell_h)
 			drawn :: self.panes[i].draw(redraw, paint)
 
 			if drawn != "" do over = true
