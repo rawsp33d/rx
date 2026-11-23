@@ -43,6 +43,9 @@ reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?
 ## All motion for link hover.
 mouse_on :: "\e[?1003h\e[?1006h"
 
+# outer kitty ids, past the scratch tints'
+image_ids :: 1 << 24
+
 Link :: struct { bid: string, at, reach: int }
 
 ## An OSC 8 link or a plain url under a cell, and the cells it spans.
@@ -877,6 +880,8 @@ Pane :: struct {
 	holding: bool
 	since: time.Instant
 	x, y, w, h: int
+	placed: int
+	sent: []int # kitty image ids
 }
 
 Pane :< {
@@ -921,9 +926,39 @@ Pane :< {
 		self.term.draw(self.x, self.y, self.w, self.h, all, paint)
 	}
 
+	images :: fn(mut self; cleared: bool) string {
+		if !self.painted do return ""
+
+		placed :: self.term.placed()
+		if !cleared && placed == self.placed do return ""
+
+		self.placed = placed
+		images :: self.term.placements()
+		ids :: images.map({ image_ids + $.generation })
+		buf := Buffer.{}
+
+		loop id in self.sent {
+			mode :: if id in ids do "i" else do "I"
+			buf.write("\e_Ga=d,d={mode},i={id},q=2\e\\")
+		}
+
+		self.sent = if cleared do [] else do self.sent.filter({ $ in ids })
+		loop i in 0..images.len() {
+			id :: ids[i]
+			if id !in self.sent {
+				buf.write(self.term.upload(images[i].id, id))
+				self.sent << id
+			}
+			buf.write(self.term.place(images[i], id, self.x, self.y, self.w, self.h))
+		}
+
+		buf.str()
+	}
+
 	close :: fn(self) {
 		self.stream.close()
 		if self.painted do self.term.free()
+		loop id in self.sent do out("\e_Ga=d,d=I,i={id},q=2\e\\")
 	}
 }
 
@@ -1448,9 +1483,12 @@ Client :< {
 			drawn :: self.panes[i].draw(redraw, paint)
 
 			if drawn != "" do over = true
-			frame += drawn
+
+			# a clear drops images too
+			frame += drawn + self.panes[i].images(all)
 			pane :: self.panes[i]
 			if pane.bid != self.bid || !pane.painted do continue
+
 			# always bracket pastes so input can tell them from typing
 			keyboard :: if self.cp.bid == pane.bid do reset_modes else do pane.term.modes() + "\e[?2004h"
 			modes :: keyboard + if self.mouse_off do "" else do mouse_on

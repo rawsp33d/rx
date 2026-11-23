@@ -109,7 +109,8 @@ pub Paint :: struct {
 
 # x and y are pixels into its top left cell
 pub Image :: struct {
-	pub id, generation: int
+	pub id: int
+	pub generation: int
 	z, col, row, x, y, width, height, src_x, src_y, src_w, src_h: int
 }
 
@@ -270,7 +271,10 @@ Term :< {
 					style = style[..(style.len() - 1)] + ";4m"
 				}
 				if dim do style = style[..(style.len() - 1)] + ";2m"
-				glyph :: self.text()
+				glyph := self.text()
+
+				# a kitty placeholder, its image gets placed over it
+				if glyph.starts_with("\u{10EEEE}") do glyph = " "
 				if tint > 0 && style == "\e[0m" && (glyph == "" || glyph == " ") {
 					skip, col = skip + 1, col + 1
 					continue
@@ -303,6 +307,7 @@ Term :< {
 		buf :: self.buf
 		discard unsafe ghostty_render_state_row_cells_get(self.cells, 8, buf) # HAS_STYLING
 		styled :: unsafe buf.read[u8]() != 0
+
 		if !styled {
 			# an erase leaves its background in the cell, not the style
 			discard unsafe ghostty_cell_get(raw, 2, buf) # CONTENT_TAG
@@ -325,6 +330,7 @@ Term :< {
 			on :: unsafe style.offset(at).read[u8]() != 0
 			if on do seq += ";" + code
 		}
+
 		underline :: unsafe style.offset(64).read[i32]()
 		if underline > 0 do seq += ";4:{underline}"
 		seq + color(style.offset(8), 30) + color(style.offset(24), 40) + color(style.offset(40), 50) + "m"
