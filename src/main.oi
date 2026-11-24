@@ -24,6 +24,7 @@ use encoding.base64
 Done :: struct { client_actions: ?[]keymap.Binding }
 Clients :: struct { clients: ?[]Peer }
 Blocks :: struct { blocks: []Block }
+Floated :: struct { layer_id: ?string }
 Peer :: struct { client_id: ?string, principal: Principal, info: ?Info, connection_state: ?string }
 Principal :: struct { display: string }
 Info :: struct { name: ?string, version: ?string, label: ?string }
@@ -1831,6 +1832,8 @@ Client :< {
 		if ev.type != "session_view_changed" || (change.revision or 0) <= self.revision do return false
 		view :: self.call[View]("session.view") or return false # killed, session_destroyed follows
 		self.apply(view)?
+		self.unstrand() or () # races other clients
+
 		# Rex keeps an empty session, tmux doesn't
 		if (view.windows or []).len() == 0 do discard self.call[Ok]("session.destroy") or Ok.{}
 		self.panes.len() == 0
@@ -2862,6 +2865,29 @@ Client :< {
 			"layout" = rex.shell(self.here(), label = label),
 			"focus" = true,
 		])?
+	}
+
+	# Rex keeps a tab open while it has a float.
+	unstrand :: fn(mut self) ! {
+		wins :: self.view.windows or []
+		loop win, i in wins {
+			if leaves(win.layers[0].layout or :null).len() > 0 do continue
+
+			blocks: []Block = loop layer in win.layers; block in layer.blocks or [] do block
+			if blocks.any({ ($.label or "") !in ["scratch", "tab scratch"] }) do continue
+
+			# where closing it lands
+			to :: wins[if i + 1 < wins.len() do i + 1 else do max(i - 1, 0)]
+			loop layer in win.layers; block in layer.blocks or [] {
+				if (block.label or "") != "scratch" || to.window_id == win.window_id do continue
+
+				self.ok("session.move_block", ["block_id" = block.block_id, "anchor_block_id" = leaves(to.layers[0].layout or :null)[0].bid])?
+				floated :: self.call[Floated]("session.float_block", ["block_id" = block.block_id, "bounds" = layer.bounds.map({ Json.($) })])?
+				self.ok("session.set_layer_state", ["layer_id" = floated.layer_id or "", "state" = "minimized"])?
+			}
+
+			discard self.call[Ok]("session.close_window", ["window_id" = win.window_id]) or Ok.{}
+		}
 	}
 
 	relayout_tab :: fn(mut self; name: string) ! {
