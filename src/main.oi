@@ -1217,7 +1217,10 @@ Client :< {
 		bid :: change.block_id or ""
 		name :: change.name or ""
 		payload :: change.payload or :null
-		if name == "bell" do self.bell(bid)
+		if name == "bell" {
+			out("\a")
+			self.flag(bid)
+		}
 		if name in ["title_changed", "program_status_changed", "program_status_removed"] && self.frames {
 			self.full = true
 		}
@@ -1230,6 +1233,10 @@ Client :< {
 			note :: json.from_json[Note](payload) or return
 			title :: if note.title != "" do note.title else do self.view.label or "rx"
 			out("\e]777;notify;" + printable(title).replace(";", ",") + ";" + printable(note.body) + "\a")
+			if !self.panes.any({ $.bid == bid }) {
+				self.flag(bid)
+				self.say(printable(if note.title != "" do note.title + ": " + note.body else do note.body))
+			}
 		}
 		if name == "title_changed" {
 			named := self.named
@@ -1813,8 +1820,7 @@ Client :< {
 		box(0, bottom - rows.len() - 2, w + 2, title, rows)
 	}
 
-	bell :: fn(mut self; bid: string) {
-		out("\a")
+	flag :: fn(mut self; bid: string) {
 		loop win in self.view.windows or [] {
 			if win.window_id == self.wid || win.window_id in self.belled do continue
 			loop layer in win.layers; leaf in leaves(layer.layout or :null) {
