@@ -842,7 +842,7 @@ pane_items :: fn() []Item {
 		Item.{ label = "Float", key = "f", action = "layer.float" },
 		Item.{ label = "Copy Mode", key = "c", action = "pane.copy" },
 		Item.{ label = "Paste", key = "p", action = "pane.paste" },
-		Item.{ label = "Close", key = "X", action = "pane.close" },
+		Item.{ label = "Close", key = "X", action = "pane.close", args = ["confirm" = true] },
 	]
 }
 
@@ -854,7 +854,7 @@ tab_items :: fn() []Item {
 		Item.{ label = "New After", key = "n", action = "tab.new", args = ["side" = "after"] },
 		Item.{ label = "New at End", key = "N", action = "tab.new" },
 		Item.{ label = "Next Layout", key = "w", action = "tab.layout" },
-		Item.{ label = "Close", key = "X", action = "tab.close" },
+		Item.{ label = "Close", key = "X", action = "tab.close", args = ["confirm" = true] },
 	]
 }
 
@@ -867,7 +867,7 @@ session_items :: fn() []Item {
 		Item.{ label = "New", key = "n", action = "session.new" },
 		Item.{ label = "Warp", key = "w", action = "session.warp" },
 		Item.{ label = "Detach", key = "d", action = "detach" },
-		Item.{ label = "Close", key = "X", action = "session.close" },
+		Item.{ label = "Close", key = "X", action = "session.close", args = ["confirm" = true] },
 	]
 }
 axis :: fn(dir: string) string { if dir == "left" || dir == "right" do "horizontal" else do "vertical" }
@@ -2372,7 +2372,7 @@ Client :< {
 		i :: self.choose(self.titles["client.palette"] or "", loop action in all do action.title or "")
 		if i < 0 do return false
 		action :: all[i]
-		args: Obj = []
+		args: Obj = if "confirm=" in keymap.arg_words(action) do ["confirm" = true] else do []
 		loop arg in (action.args or keymap.Schema.{}).required or [] {
 			answer :: self.ask("{action.title or action.name} {arg}: ")
 			if answer == "" do return false
