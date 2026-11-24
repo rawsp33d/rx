@@ -1317,7 +1317,11 @@ Client :< {
 		}
 		self.wid = win.window_id
 		self.bid = bid
-		self.belled = loop wid in self.belled { if wid == self.wid do continue; wid }
+		self.belled = loop id in self.belled {
+			if id == self.wid || win.layers.any({ ($.layer_id or "") == id && ($.state or "") != "minimized" }) do continue
+			id
+		}
+
 		tiled :: (win.layers.find({ $.kind == "tiled" }) or Layer.{}).layer_id or ""
 		self.areas = [Area.{ w = self.cols, h = h - if self.frames do 1 else do 0, id = tiled }]
 		whole :: [0.0, 0.0, 1.0, 1.0]
@@ -1714,6 +1718,7 @@ Client :< {
 			flags := ""
 			if win.zoomed_block_id != none do flags += " Z"
 			if minimized(win) do flags += " M"
+			if win.layers.any({ ($.layer_id or "") in self.belled }) do flags += "!"
 			if wid in self.synced do flags += " S"
 			if wid in self.tiling do flags += " T"
 			if wid in self.belled do flags += " !"
@@ -1853,11 +1858,16 @@ Client :< {
 	}
 
 	flag :: fn(mut self; bid: string) {
-		loop win in self.view.windows or [] {
-			if win.window_id == self.wid || win.window_id in self.belled do continue
-			loop layer in win.layers; leaf in leaves(layer.layout or :null) {
-				if leaf.bid == bid do self.belled << win.window_id
+		loop win in self.view.windows or []; layer in win.layers {
+			if !leaves(layer.layout or :null).any({ $.bid == bid }) do continue
+
+			id := win.window_id
+			if id == self.wid {
+				if (layer.state or "") != "minimized" do continue
+				id = layer.layer_id or ""
 			}
+
+			if id !in self.belled do self.belled << id
 		}
 		self.draw()
 	}
