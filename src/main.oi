@@ -310,11 +310,10 @@ default_label :: fn(win: Window) bool {
 }
 
 proxy :: fn(sock, cmd: string, rest: []string) {
-	rest.map(quote)
+	os.exit(rest.map(quote)
 		|> $.join(" ")
 		|> os.sh("rex -S {quote(sock)} {cmd} " + $)
-		|> int.($)
-		|> os.exit($)
+		|> int.($))
 }
 
 autostart :: fn(sock: string) {
