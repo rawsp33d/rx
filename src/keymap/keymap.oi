@@ -37,6 +37,7 @@ pub REQUEST :: r"""{
 		{"name": "pane.hints", "kind": "client", "title": "copy text by hint"},
 		{"name": "client.palette", "kind": "client", "title": "command palette"},
 		{"name": "client.prompt", "kind": "client", "title": "command prompt"},
+		{"name": "client.msg", "kind": "client", "title": "show a message", "args": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
 		{"name": "buffer.choose", "kind": "client", "title": "paste an earlier copy"},
 		{"name": "client.choose", "kind": "client", "title": "detach a client"},
 		{"name": "client.detach_others", "kind": "client", "title": "detach other clients"},
@@ -118,6 +119,7 @@ pub Args :: struct {
 	pub session_id: ?string,
 	pub window_id: ?string,
 	pub opacity: ?float,
+	pub text: ?string,
 }
 
 pub Keymap :: struct {

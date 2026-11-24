@@ -2632,6 +2632,7 @@ Client :< {
 				loop peer in self.others()? do self.kick(peer) or {}
 			},
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
+			"client.msg" => self.say(opts.text or return error("client.msg needs text")),
 			"client.prompt" => {
 				typed :: words(self.ask(": ", self.can.keys, self.arg_words))
 				if typed.len() == 0 do return false
