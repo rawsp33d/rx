@@ -1472,6 +1472,7 @@ Client :< {
 	data :: fn(mut self; chunk: rex.Chunk) {
 		loop i in 0..self.pipes.len() {
 			if self.pipes[i].id != chunk.id do continue
+
 			data :: chunk.data or {
 				pipe :: self.pipes[i]
 				self.pipes[i].stream = pipe.stream.resume(pipe.read) or {
@@ -1483,14 +1484,20 @@ Client :< {
 			self.pipes[i].feed(data)
 			return
 		}
+
 		loop i in 0..self.panes.len() {
 			if self.panes[i].id != chunk.id do continue
+
 			data :: chunk.data or {
 				self.revive(i)
 				return
 			}
+
 			self.panes[i].read += data.len()
+			fresh :: !self.panes[i].painted
 			if !self.panes[i].feed(data, self.cid) do self.owned = false
+			if fresh && self.panes[i].painted do self.resume_copy(i)
+
 			self.landed()
 			return
 		}
@@ -1997,7 +2004,7 @@ Client :< {
 	}
 
 	copy_key :: fn(mut self; key: keys.Key) {
-		pane :: self.focused() or return
+		pane :: self.painted() or return
 		name := if key.text != "" do key.text else do key.names[0]
 		if name == "/" || name == "?" {
 			needle :: self.ask(name)
@@ -2032,13 +2039,40 @@ Client :< {
 		self.full = true
 	}
 
+	# a reopened pane is a fresh terminal, put its copy mode back on it
+	resume_copy :: fn(mut self; i: int) {
+		pane :: self.panes[i]
+		mode := self.copy_of(pane.bid)
+		if mode.bid == "" do return
+
+		_, _, total := pane.term.viewport()
+		mode.ay = clamp(mode.ay, 0, total - 1)
+		mode.go(pane.term, mode.x, mode.y)
+		mode.marks = pane.term.find(mode.needle)
+		ax, ay, bx, by := mode.ends(pane.term)
+		pane.term.select(
+			ax,
+			if mode.sel == "" do -1 else do ay,
+			bx,
+			by,
+			mode.sel == "ctrl+v",
+		)
+		if self.cp.bid == mode.bid {
+			self.cp = mode
+			return
+		}
+		self.parked = loop old in self.parked { if old.bid == mode.bid do mode else do old }
+	}
+
 	refocus :: fn(mut self) {
 		parked := self.parked
 		if self.cp.bid != "" do parked << self.cp
 		self.cp = Copy.{}
-		shown: []string = loop pane in self.panes do pane.bid
+
+		# kept off screen too, until the block is gone
+		bids :: loop win in self.view.windows or []; layer in win.layers; leaf in leaves(layer.layout or :null) do leaf.bid
 		self.parked = loop mode in parked {
-			if mode.bid !in shown do continue
+			if mode.bid !in bids do continue
 			if mode.bid == self.bid {
 				self.cp = mode
 				continue
