@@ -15,7 +15,7 @@ pub REQUEST :: r"""{
 		{"name": "session.previous", "kind": "client", "title": "previous session"},
 		{"name": "session.goto", "kind": "client", "title": "go to session", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
 		{"name": "session.select", "kind": "client", "title": "select session", "args": {"type": "object", "properties": {"session_id": {"type": "string"}, "window_id": {"type": "string"}}, "required": ["session_id"]}},
-		{"name": "pane.split", "kind": "client", "title": "split pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}}}},
+		{"name": "pane.split", "kind": "client", "title": "split pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "command": {"type": "string"}, "title": {"type": "string"}}}},
 		{"name": "pane.break", "kind": "client", "title": "break pane to tab"},
 		{"name": "pane.mark", "kind": "client", "title": "mark pane"},
 		{"name": "pane.join", "kind": "client", "title": "join marked pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
@@ -47,9 +47,9 @@ pub REQUEST :: r"""{
 		{"name": "pane.dim", "kind": "client", "title": "dim unfocused panes"},
 		{"name": "macro.record", "kind": "client", "title": "record macro"},
 		{"name": "macro.play", "kind": "client", "title": "play macro"},
-		{"name": "layer.new", "kind": "client", "title": "extra", "args": {"type": "object", "properties": {"command": {"type": "string"}, "keep": {"type": "boolean"}, "bounds": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}}},
-		{"name": "pane.pipe", "kind": "client", "title": "pipe output", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
-		{"name": "pane.run", "kind": "client", "title": "run command", "args": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+		{"name": "layer.new", "kind": "client", "title": "extra", "args": {"type": "object", "properties": {"command": {"type": "string"}, "title": {"type": "string"}, "keep": {"type": "boolean"}, "bounds": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}}},
+		{"name": "pane.pipe", "kind": "client", "title": "pipe output", "args": {"type": "object", "properties": {"command": {"type": "string"}, "title": {"type": "string"}}}},
+		{"name": "pane.run", "kind": "client", "title": "run command", "args": {"type": "object", "properties": {"command": {"type": "string"}, "title": {"type": "string"}}, "required": ["command"]}},
 		{"name": "layer.move", "kind": "client", "title": "move layer", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
 		{"name": "pane.swap", "kind": "client", "title": "swap pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
 		{"name": "layer.raise", "kind": "client", "title": "raise layer"},
@@ -60,7 +60,7 @@ pub REQUEST :: r"""{
 		{"name": "layer.toggle_all", "kind": "client", "title": "toggle layers"},
 		{"name": "layer.scratch", "kind": "client", "title": "toggle scratch float", "args": {"type": "object", "properties": {"opacity": {"type": "number", "minimum": 0, "maximum": 1}}}},
 		{"name": "layer.scratch_tab", "kind": "client", "title": "toggle tab scratch float", "args": {"type": "object", "properties": {"opacity": {"type": "number", "minimum": 0, "maximum": 1}}}},
-		{"name": "tab.new", "kind": "client", "title": "new tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}}}},
+		{"name": "tab.new", "kind": "client", "title": "new tab", "args": {"type": "object", "properties": {"side": {"enum": ["before", "after"]}, "command": {"type": "string"}, "title": {"type": "string"}}}},
 		{"name": "tab.next", "kind": "client", "title": "next tab"},
 		{"name": "tab.previous", "kind": "client", "title": "previous tab"},
 		{"name": "tab.last", "kind": "client", "title": "last tab"},
@@ -123,6 +123,7 @@ pub Args :: struct {
 	pub confirm: ?bool,
 	pub keep: ?bool,
 	pub bounds: ?json.Arr,
+	pub title: ?string,
 }
 
 pub Keymap :: struct {
@@ -288,8 +289,12 @@ mods :: fn(key: string) string {
 title_of :: fn(binding: Binding, titles: [string]string, dir := true) string {
 	empty: json.Obj = []
 	args :: json.from_json[Args](binding.args or { empty }) or Args.{}
+	if title := args.title do return title
+
 	detail := args.command or args.layout or args.side or args.name or ""
-	if dir do detail = args.direction or { detail }
+	if dir {
+		detail = args.direction or do detail
+	}
 	if i := args.index do detail = i.str()
 	(titles[binding.action] or binding.action) + if detail != "" do " " + detail else do ""
 }

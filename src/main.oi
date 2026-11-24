@@ -2552,7 +2552,8 @@ Client :< {
 		empty: Obj = []
 		opts :: json.from_json[keymap.Args](args or { empty }) or keymap.Args.{}
 		dir :: opts.direction or "right"
-		title :: self.titles[name] or { name }
+		title :: opts.title or { self.titles[name] or do name }
+
 		if (opts.confirm or false) && !self.confirm(title) do return false
 
 		match name {

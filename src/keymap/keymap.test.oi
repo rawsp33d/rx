@@ -45,3 +45,10 @@ test! "which-key rows" {
 	got :: (loop (keys, title) in rows do "{keys}={title}").join(", ")
 	assert! got == "w=tab.layout…, v=pane…, n=tab.new after, shift+h/l=resize pane, h/l=focus pane, left/right=focus pane" && groups == 2
 }
+
+test! "title" {
+	titles: [string]string = ["layer.new" = "extra"]
+	plain :: json.decode[Binding](r"""{"keys": ["c"], "action": "layer.new", "args": {"command": "fzf"}}""") or panic!($.message())
+	named :: json.decode[Binding](r"""{"keys": ["c"], "action": "layer.new", "args": {"command": "fzf", "title": "file"}}""") or panic!($.message())
+	assert! title_of(plain, titles) == "extra fzf" && title_of(named, titles) == "file"
+}
