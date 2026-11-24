@@ -73,7 +73,7 @@ pub REQUEST :: r"""{
 		{"name": "tab.rename", "kind": "client", "title": "rename tab"},
 		{"name": "tab.choose", "kind": "client", "title": "choose tab in any session"},
 		{"name": "tab.layout", "kind": "client", "title": "layout", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled", "next", "previous"]}}}},
-		{"name": "tab.tile", "kind": "client", "title": "auto tile", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]}}}},
+		{"name": "tab.tile", "kind": "client", "title": "auto tile", "args": {"type": "object", "properties": {"layout": {"enum": ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9}, "main": {"type": "integer", "minimum": 1}}}},
 		{"name": "client.mode.enter", "kind": "client", "title": "enter mode", "args": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 		{"name": "client.mode.exit", "kind": "client", "title": "exit mode"},
 		{"name": "client.mode.exit_all", "kind": "client", "title": "exit all modes"}
@@ -124,6 +124,8 @@ pub Args :: struct {
 	pub keep: ?bool,
 	pub bounds: ?json.Arr,
 	pub title: ?string,
+	pub ratio: ?float,
+	pub main: ?int,
 }
 
 pub Keymap :: struct {

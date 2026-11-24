@@ -63,17 +63,26 @@ pub layouts :: ["even-horizontal", "even-vertical", "main-horizontal", "main-ver
 
 pub Move :: struct { pub bid: string, pub anchor: string, pub direction: string, pub ratio: float }
 
-pub arrange :: fn(bids: []string, name: string) []Move {
+pub Tile :: struct { pub name: string, pub ratio: float = 0.7, pub main: int = 1 }
+
+pub arrange :: fn(bids: []string, tile: Tile) []Move {
 	count :: bids.len()
+	name :: tile.name
 	if count < 2 do return []
 	if name == "even-horizontal" || name == "even-vertical" do return even(bids, name[5..])
+
 	if name.starts_with("main-") {
-		# main-vertical puts the main pane left of a column of the rest, main-horizontal above a row
+		# main-vertical puts the main panes left of a column of the rest, main-horizontal above a row
 		across :: if name == "main-vertical" do "horizontal" else do "vertical"
-		out := [Move.{ bid = bids[1], anchor = bids[0], direction = across, ratio = 0.7 }]
-		out << even(bids[1..], if across == "horizontal" do "vertical" else do "horizontal")
+		along :: if across == "horizontal" do "vertical" else do "horizontal"
+		if tile.main >= count do return even(bids, along)
+
+		out := [Move.{ bid = bids[tile.main], anchor = bids[0], direction = across, ratio = tile.ratio }]
+		out << even(bids[..tile.main], along)
+		out << even(bids[tile.main..], along)
 		return out
 	}
+
 	cols := 1
 	loop cols * cols < count do cols += 1
 	rows: [][]string = loop row in 0..((count + cols - 1) / cols) {

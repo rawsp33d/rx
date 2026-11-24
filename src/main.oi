@@ -17,7 +17,7 @@ use keys
 use keymap
 use ghostty
 use prompt.{ complete, chop, value, words, fuzzy, matches, substrings }
-use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift, border }
+use layout.{ Area, Tile, layouts, arrange, rotation, evened, stretch, shift, border }
 use copy.{ Copy, Hit, hits, word }
 use encoding.base64
 
@@ -1045,7 +1045,8 @@ Client :: struct {
 	progress: [string]Progress # OSC 9;4, by block id
 	seen: [string]()
 	layout: int
-	tiling, tiled_as: [string]string # auto tiling like dvtm, by window
+	tiling: [string]Tile # auto tiling like dvtm, by window
+	tiled_as: [string]string
 	cp, land: Copy
 	parked: []Copy
 	buffers: []string
@@ -1145,14 +1146,14 @@ Client :< {
 	}
 
 	retile :: fn(mut self) ! {
-		name :: self.tiling[self.wid] or return ()
+		tile :: self.tiling[self.wid] or return ()
 		bids :: self.tiled()
 		key :: bids.join(" ")
 		if (self.tiled_as[self.wid] or "") == key do return ()
 		tiled_as := self.tiled_as # can't index assign a field's map
 		tiled_as[self.wid] = key
 		self.tiled_as = tiled_as
-		self.arrange(bids, name)?
+		self.arrange(bids, tile)?
 	}
 
 	tiled :: fn(self) []string {
@@ -1160,8 +1161,8 @@ Client :< {
 		leaves(layer.layout or :null).map({ $.bid })
 	}
 
-	arrange :: fn(mut self; bids: []string, name: string) ! {
-		loop step in arrange(bids, name) {
+	arrange :: fn(mut self; bids: []string, tile: Tile) ! {
+		loop step in arrange(bids, tile) {
 			self.ok("session.move_block", [
 				"block_id" = step.bid, "anchor_block_id" = step.anchor,
 				"direction" = step.direction, "side" = "after", "ratio" = step.ratio,
@@ -2849,33 +2850,43 @@ Client :< {
 			},
 			"tab.layout" => self.relayout_tab(opts.layout or "next")?,
 			"tab.tile" => {
-				name := opts.layout or "main-vertical"
+				tile := self.tiling[self.wid] or Tile.{ name = "main-vertical" }
+				name :: opts.layout or tile.name
 				if name !in layouts do return error("no layout {name}")
-				if (self.tiling[self.wid] or "") == name do name = ""
-				tiling: [string]string = .[]
+
+				off :: self.wid in self.tiling && name == tile.name && opts.ratio == none && opts.main == none
+				tile.name = name
+				tile.ratio = opts.ratio or tile.ratio
+				tile.main = opts.main or tile.main
+				tiling: [string]Tile = .[]
+
 				loop layout, wid in self.tiling {
 					if wid != self.wid do tiling[wid] = layout
 				}
-				if name != "" do tiling[self.wid] = name
+				if !off do tiling[self.wid] = tile
+
 				self.tiling = tiling
 				self.tiled_as = .[]
 				self.retile()?
-				self.say(if name != "" do "tiling {name}" else do "tiling off")
+				self.say(if off do "tiling off" else do "tiling {name}")
 			},
 			"tab.rename" => self.rename_tab(self.view.active_window_id or "")?,
 			"tab.choose" => {
 				conn := rex.connect(self.sock)?
 				defer conn.close()
 				discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"])?
+
 				items, sids, wids := []string.{}, []string.{}, []string.{}
 				loop session in conn.call[Sessions]("session.list")?.sessions {
 					wins :: (conn.call[View]("session.view", ["session_id" = session.session_id]) or continue).windows or []
+
 					loop i in 0..wins.len() {
 						items << "{session.label} {i + 1} {self.tab_name(wins[i])}"
 						sids << session.session_id
 						wids << wins[i].window_id
 					}
 				}
+
 				previews: [string][]string
 				sock :: self.sock
 				look :: fn [mut previews, sock, sids, wids] (index: int) []string {
@@ -2883,6 +2894,7 @@ Client :< {
 					previews[wids[index]] or []
 				}
 				i :: self.choose(title, items, look)
+
 				if i < 0 do return false
 				return self.act("session.select", Json.(["session_id" = sids[i], "window_id" = wids[i]]))
 			},
@@ -2976,7 +2988,7 @@ Client :< {
 		}
 
 		self.layout = i
-		self.arrange(self.tiled(), layouts[i])?
+		self.arrange(self.tiled(), Tile.{ name = layouts[i] })?
 		self.say(layouts[i])
 	}
 

@@ -3,11 +3,12 @@ use json.{ Json }
 use rex
 
 test! "layouts" {
-	show :: fn(bids: []string, name: string) string {
-		(loop step in arrange(bids, name) do "{step.bid}>{step.anchor} {step.direction[..1]} {step.ratio}").join(", ")
+	show :: fn(bids: []string, tile: Tile) string {
+		(loop step in arrange(bids, tile) do "{step.bid}>{step.anchor} {step.direction[..1]} {step.ratio}").join(", ")
 	}
-	assert! show(["a", "b", "c"], "main-horizontal") == "b>a v 0.7, c>b h 0.5"
-	assert! show(["a", "b", "c", "d", "e"], "tiled") == "d>a v 0.5, b>a h 0.3333333333333333, c>b h 0.5, e>d h 0.5"
+	assert! show(["a", "b", "c"], Tile.{ name = "main-horizontal" }) == "b>a v 0.7, c>b h 0.5"
+	assert! show(["a", "b", "c", "d"], Tile.{ name = "main-vertical", main = 2 }) == "c>a h 0.7, b>a v 0.5, d>c v 0.5"
+	assert! show(["a", "b", "c", "d", "e"], Tile.{ name = "tiled" }) == "d>a v 0.5, b>a h 0.3333333333333333, c>b h 0.5, e>d h 0.5"
 	assert! (loop (from, to) in rotation(["a", "b", "c"], false) do from + to).join(" ") == "cb ca"
 	# a | (b over c) | d
 	tree :: json.parse(r"""{"rect": [0, 0, 1, 1], "split": {"direction": "horizontal", "ratio": 0.2,
