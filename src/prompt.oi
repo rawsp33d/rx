@@ -52,6 +52,30 @@ pub matches :: fn(query, text: string) at: []int {
 	at
 }
 
+# zoxide's match, words in order with the last one in the last component
+pub substrings :: fn(query, text: string) at: []int {
+	have :: text.lower()
+	terms :: query.lower().split(" ").filter({ $ != "" })
+	from := 0
+
+	loop word, k in terms {
+		if k == terms.len() - 1 {
+			loop j in from..have.len() {
+				if have[j] == '/' do from = j + 1
+			}
+		}
+
+		loop j in from..(have.len() - word.len() + 1) {
+			if !have[j..].starts_with(word) do continue
+
+			loop i in j..(j + word.len()) do at << i
+			from = j + word.len()
+			break
+		}
+	}
+	at
+}
+
 pub fuzzy :: fn(query, text: string) bool {
 	matches(query, text).len() == query.len()
 }
@@ -63,6 +87,10 @@ test! "chop" {
 test! "fuzzy" {
 	assert! fuzzy("zp", "Zoom Pane") && !fuzzy("pz", "Zoom Pane")
 	assert! matches("zp", "Zoom Pane") == [0 5]
+}
+
+test! "substrings" {
+	assert! substrings("d s", "~/Dev/src") == [2 6] && substrings("src", "~/src/lab/src") == [10 11 12]
 }
 
 test! "complete and words" {

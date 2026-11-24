@@ -16,7 +16,7 @@ use strip
 use keys
 use keymap
 use ghostty
-use prompt.{ complete, chop, value, words, fuzzy, matches }
+use prompt.{ complete, chop, value, words, fuzzy, matches, substrings }
 use layout.{ Area, layouts, arrange, rotation, evened, stretch, shift, border }
 use copy.{ Copy, Hit, hits, word }
 use encoding.base64
@@ -471,7 +471,8 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 				cache[query] = found.split("\n").filter({ $ != "" && fs.Path.($).name() !in labels })
 			}
 			loop dir in cache[query] or [] {
-				"new in " + if dir.starts_with(home) do "~" + dir[home.len()..] else do dir
+				path :: if dir.starts_with(home) do "~" + dir[home.len()..] else do dir
+				"new in " + accent(path, substrings(query, path))
 			}
 		}
 
@@ -550,7 +551,7 @@ viewers :: fn(sock: string, sessions: []Session) []int {
 	discard conn.call[Sessions]("session.attach_all", ["event_scope" = "session"]) or Sessions.{}
 	loop session in sessions {
 		found :: conn.call[Clients]("session.list_clients", ["session_id" = session.session_id]) or Clients.{}
-		(found.clients or []).len()
+		(found.clients or []).filter({ ($.connection_state or "") != "lost" }).len()
 	}
 }
 
@@ -632,7 +633,8 @@ List :< {
 				if k + off < hits.len() {
 					hit :: hits[k + off]
 					tag :: if hit < tags.len() do tags[hit] else do ""
-					pad(tag, gutter) + accent(all[hit], matches(query, all[hit]))
+					# more rows come highlighted by whatever matched them
+					pad(tag, gutter) + if hit < items.len() do accent(all[hit], matches(query, all[hit])) else do all[hit]
 				} else do ""
 			}
 			on :: if hits.len() > 0 do i - off else do -1
