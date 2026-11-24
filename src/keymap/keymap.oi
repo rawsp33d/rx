@@ -9,7 +9,7 @@ pub REQUEST :: r"""{
 		{"name": "session.new", "kind": "client", "title": "new session"},
 		{"name": "session.warp", "kind": "client", "title": "warp to session"},
 		{"name": "session.rename", "kind": "client", "title": "rename session"},
-		{"name": "session.close", "kind": "client", "title": "close session"},
+		{"name": "session.close", "kind": "client", "title": "close session", "args": {"type": "object", "properties": {"confirm": {"type": "boolean"}}}},
 		{"name": "session.next", "kind": "client", "title": "next session"},
 		{"name": "session.last", "kind": "client", "title": "last session"},
 		{"name": "session.previous", "kind": "client", "title": "previous session"},
@@ -21,7 +21,7 @@ pub REQUEST :: r"""{
 		{"name": "pane.join", "kind": "client", "title": "join marked pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
 		{"name": "pane.rotate", "kind": "client", "title": "rotate panes", "args": {"type": "object", "properties": {"direction": {"enum": ["down", "up"]}}}},
 		{"name": "pane.edit", "kind": "client", "title": "edit scrollback"},
-		{"name": "pane.close", "kind": "client", "title": "close pane"},
+		{"name": "pane.close", "kind": "client", "title": "close pane", "args": {"type": "object", "properties": {"confirm": {"type": "boolean"}}}},
 		{"name": "pane.zoom", "kind": "client", "title": "zoom pane"},
 		{"name": "pane.focus", "kind": "client", "title": "focus pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}}}},
 		{"name": "pane.resize", "kind": "client", "title": "resize pane", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
@@ -56,7 +56,7 @@ pub REQUEST :: r"""{
 		{"name": "layer.lower", "kind": "client", "title": "lower layer"},
 		{"name": "layer.minimize", "kind": "client", "title": "minimize layer"},
 		{"name": "layer.restore", "kind": "client", "title": "restore minimized layer"},
-		{"name": "layer.close", "kind": "client", "title": "close layer"},
+		{"name": "layer.close", "kind": "client", "title": "close layer", "args": {"type": "object", "properties": {"confirm": {"type": "boolean"}}}},
 		{"name": "layer.toggle_all", "kind": "client", "title": "toggle layers"},
 		{"name": "layer.scratch", "kind": "client", "title": "toggle scratch float", "args": {"type": "object", "properties": {"opacity": {"type": "number", "minimum": 0, "maximum": 1}}}},
 		{"name": "layer.scratch_tab", "kind": "client", "title": "toggle tab scratch float", "args": {"type": "object", "properties": {"opacity": {"type": "number", "minimum": 0, "maximum": 1}}}},
@@ -66,7 +66,7 @@ pub REQUEST :: r"""{
 		{"name": "tab.last", "kind": "client", "title": "last tab"},
 		{"name": "client.tab.goto", "kind": "client", "title": "go to tab", "args": {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]}},
 		{"name": "tab.move", "kind": "client", "title": "move tab", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "left"]}}}},
-		{"name": "tab.close", "kind": "client", "title": "close tab"},
+		{"name": "tab.close", "kind": "client", "title": "close tab", "args": {"type": "object", "properties": {"confirm": {"type": "boolean"}}}},
 		{"name": "tab.even", "kind": "client", "title": "even out panes"},
 		{"name": "tab.sync", "kind": "client", "title": "synchronize panes"},
 		{"name": "pane.group", "kind": "client", "title": "toggle typing group"},
@@ -120,6 +120,7 @@ pub Args :: struct {
 	pub window_id: ?string,
 	pub opacity: ?float,
 	pub text: ?string,
+	pub confirm: ?bool,
 }
 
 pub Keymap :: struct {

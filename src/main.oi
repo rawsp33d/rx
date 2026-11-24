@@ -519,9 +519,7 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 		if name == "ctrl+x" {
 			targets :: if marks.len() > 0 do marks else do [id]
 			names :: sessions.filter({ $.session_id in targets }).map({ $.label }).join(", ")
-			out(bottom + "close {names}? y to confirm")
-			answer :: input.next() or return ("", "")
-			if answer.names[0] == "y" {
+			if confirm(mut input, "close {names}") {
 				loop target in targets {
 					sessions = manage(sock, "session.destroy", ["session_id" = target]) or { bad = $.message(); sessions }
 				}
@@ -724,6 +722,12 @@ ask :: fn(mut input: Input, prompt: string, names: []string = [], args: [string]
 		if name in ["backspace", "ctrl+h"] do line = chop(line)
 		if name == "tab" do line = complete(line, names, args) else do line += key.text
 	}
+}
+
+confirm :: fn(mut input: Input, prompt: string) bool {
+	out("{bottom}{prompt}? y to confirm")
+	key :: input.next() or return false
+	key.names[0] == "y"
 }
 
 toggle :: fn(items: []string, item: string) []string {
@@ -1563,6 +1567,14 @@ Client :< {
 		line :: ask(mut self.keys, prompt, names, args)
 		self.redraw()
 		line
+	}
+
+	confirm :: fn(mut self; prompt: string) bool {
+		out(reset_modes)
+		self.modes = ""
+		yes :: confirm(mut self.keys, prompt)
+		self.redraw()
+		yes
 	}
 
 	say :: fn(mut self; msg: string, bad := false) {
@@ -2503,6 +2515,7 @@ Client :< {
 		opts :: json.from_json[keymap.Args](args or { empty }) or keymap.Args.{}
 		dir :: opts.direction or "right"
 		title :: self.titles[name] or { name }
+		if (opts.confirm or false) && !self.confirm(title) do return false
 
 		match name {
 			"detach" => return true,
