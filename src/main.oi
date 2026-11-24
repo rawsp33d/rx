@@ -371,7 +371,7 @@ run :: fn(sock: string, opts: Options) ! {
 	cur, prev := "", "" # for session.last
 	loop {
 		sessions :: conn.call[Sessions]("session.list")?.sessions
-		if choose do label, dir = pick(sock, sessions, mut input, label)
+		if choose do label, dir = pick(sock, sessions, mut input, cur)
 		if label == "" do break
 		sid := ""
 		if session := sessions.find({ $.label == label || $.session_id == label }) {
@@ -453,7 +453,7 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 		counts :: viewers(sock, sessions)
 		list.tags = loop session, j in sessions {
 			number :: if j < 9 do "{j + 1}" else do " "
-			here :: if session.label == at do "*" else do " "
+			here :: if session.session_id == at do "*" else do " "
 			other :: if counts[j] > 0 do "+" else do " "
 			mark :: if session.session_id in marks do "x" else do " "
 			"{number} {here}{other}{mark} "
@@ -485,7 +485,7 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 
 		if name in ["", "esc", "ctrl+c"] {
 			# back to the session it was opened from, if that's still around
-			if name != "" && sessions.any({ $.label == at }) do return (at, "")
+			if name != "" && sessions.any({ $.session_id == at }) do return (at, "")
 			return ("", "")
 		}
 		if name == "alt+enter" || name == "enter" && (picked < 0 || query == ".") {
@@ -501,7 +501,7 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 		if picked < 0 do continue
 
 		id :: sessions[picked].session_id
-		if name == "enter" do return (sessions[picked].label, "")
+		if name == "enter" do return (id, "")
 
 		if name == "tab" {
 			marks = toggle(marks, id)
