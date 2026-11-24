@@ -34,6 +34,7 @@ Part :: struct { data: string, eof: bool }
 Text :: struct { content: string, id: ?int, total: ?int }
 Note :: struct { title: string, body: string }
 Report :: struct { state: string, progress: ?int }
+Progress :: struct { mark: string, at: time.Instant }
 Title :: struct { title: string }
 Status :: struct { id: string, record: Record }
 Record :: struct { id: ?string, state: string }
@@ -1041,7 +1042,7 @@ Client :: struct {
 	opacities: [string]float # by scratch label
 	bg: string # OSC 11
 	status: [string]string # OSC 7501, by block id, newline, record id
-	progress: [string]string # OSC 9;4, by block id
+	progress: [string]Progress # OSC 9;4, by block id
 	seen: [string]()
 	layout: int
 	tiling, tiled_as: [string]string # auto tiling like dvtm, by window
@@ -1219,8 +1220,7 @@ Client :< {
 
 	win_progress :: fn(self; win: Window) string {
 		loop layer in win.layers; leaf in leaves(layer.layout or :null) {
-			report :: self.progress[leaf.bid] or ""
-			if report != "" do return report
+			if report := self.progress[leaf.bid] do return report.mark
 		}
 		""
 	}
@@ -1272,14 +1272,17 @@ Client :< {
 			}
 			"progress_report" => {
 				report :: json.from_json[Report](payload) or return
+				percent :: if value := report.progress do "{value}%" else do ""
 				progress := self.progress
-				progress[bid] = match report.state {
+				mark :: match report.state {
 					"remove" => "",
-					"error" => " ✗",
-					_ => if percent := report.progress do " {percent}%" else do " %",
+					"error" => " ✗" + percent,
+					"pause" => " ‖" + percent,
+					_ => " " + if percent != "" do percent else do "%",
 				}
+				progress[bid] = .{ mark = mark, at = time.Instant.now() }
 				self.progress = progress
-				()
+				self.prune()
 			}
 			"program_status_removed" => {
 				if redraw do self.full = true
@@ -1585,8 +1588,19 @@ Client :< {
 		2.sec()
 	}
 
+	# reports expire 15s after their last update, like ghostty
+	prune :: fn(mut self) {
+		progress: [string]Progress = .[]
+		loop report, bid in self.progress {
+			if report.mark != "" && report.at.elapsed() < 15.sec() do progress[bid] = report
+		}
+		self.progress = progress
+	}
+
 	tick :: fn(mut self) {
 		if self.msg != "" && self.msg_at.elapsed() > 3.sec() do self.msg = ""
+		self.prune()
+
 		if self.flash != "" && self.click_at.elapsed() > 300.ms() {
 			loop pane in self.panes {
 				if pane.bid != self.flash || !pane.painted || self.copying(pane.bid) do continue
