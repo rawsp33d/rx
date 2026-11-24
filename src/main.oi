@@ -33,6 +33,7 @@ Clip :: struct { text: ?string, id: ?int, bytes: ?int }
 Part :: struct { data: string, eof: bool }
 Text :: struct { content: string, id: ?int, total: ?int }
 Note :: struct { title: string, body: string }
+Report :: struct { state: string, progress: ?int }
 Title :: struct { title: string }
 Status :: struct { id: string, record: Record }
 Record :: struct { id: ?string, state: string }
@@ -1038,6 +1039,7 @@ Client :: struct {
 	opacities: [string]float # by scratch label
 	bg: string # OSC 11
 	status: [string]string # OSC 7501, by block id, newline, record id
+	progress: [string]string # OSC 9;4, by block id
 	seen: [string]()
 	layout: int
 	tiling, tiled_as: [string]string # auto tiling like dvtm, by window
@@ -1213,55 +1215,82 @@ Client :< {
 		return
 	}
 
+	win_progress :: fn(self; win: Window) string {
+		loop layer in win.layers; leaf in leaves(layer.layout or :null) {
+			report :: self.progress[leaf.bid] or ""
+			if report != "" do return report
+		}
+		""
+	}
+
 	block_event :: fn(mut self; change: Change) {
 		bid :: change.block_id or ""
-		name :: change.name or ""
 		payload :: change.payload or :null
-		if name == "bell" {
-			out("\a")
-			self.flag(bid)
-		}
-		if name in ["title_changed", "program_status_changed", "program_status_removed"] && self.frames {
-			self.full = true
-		}
-		if name == "clipboard_written" {
-			clip :: json.from_json[Clip](payload) or Clip.{}
-			text :: clip.text or if (clip.bytes or 0) > 0 do self.read_clip(bid, clip.id or 0) else do ""
-			if text != "" do self.clip(text)
-		}
-		if name == "desktop_notification" {
-			note :: json.from_json[Note](payload) or return
-			title :: if note.title != "" do note.title else do self.view.label or "rx"
-			out("\e]777;notify;" + printable(title).replace(";", ",") + ";" + printable(note.body) + "\a")
-			if !self.panes.any({ $.bid == bid }) {
+		redraw :: self.frames
+
+		match change.name or "" {
+			"bell" => {
+				out("\a")
 				self.flag(bid)
-				self.say(printable(if note.title != "" do note.title + ": " + note.body else do note.body))
 			}
-		}
-		if name == "title_changed" {
-			named := self.named
-			named[bid] = (json.from_json[Title](payload) or Title.{}).title
-			self.named = named
-		}
-		if name == "process_changed" {
-			fg := self.fg
-			fg[bid] = command((json.from_json[Process](payload) or Process.{}).foreground)
-			self.fg = fg
-		}
-		if name == "program_status_changed" {
-			update :: json.from_json[Status](payload) or return
-			status := self.status
-			status["{bid}\n{update.id}"] = update.record.state
-			self.status = status
-		}
-		if name == "program_status_removed" {
-			removed :: json.from_json[Removed](payload) or return
-			gone: []string = loop i in removed.ids do "{bid}\n{i}"
-			status: [string]string = .[]
-			loop state, key in self.status {
-				if key !in gone do status[key] = state
+			"clipboard_written" => {
+				clip :: json.from_json[Clip](payload) or Clip.{}
+				text :: clip.text or if (clip.bytes or 0) > 0 do self.read_clip(bid, clip.id or 0) else do ""
+				if text != "" do self.clip(text)
 			}
-			self.status = status
+			"desktop_notification" => {
+				note :: json.from_json[Note](payload) or return
+				title :: if note.title != "" do note.title else do self.view.label or "rx"
+				out("\e]777;notify;" + printable(title).replace(";", ",") + ";" + printable(note.body) + "\a")
+				if !self.panes.any({ $.bid == bid }) {
+					self.flag(bid)
+					self.say(printable(if note.title != "" do note.title + ": " + note.body else do note.body))
+				}
+			}
+			"title_changed" => {
+				if redraw do self.full = true
+				named := self.named
+				named[bid] = (json.from_json[Title](payload) or Title.{}).title
+				self.named = named
+				()
+			}
+			"process_changed" => {
+				fg := self.fg
+				fg[bid] = command((json.from_json[Process](payload) or Process.{}).foreground)
+				self.fg = fg
+				()
+			}
+			"program_status_changed" => {
+				if redraw do self.full = true
+				update :: json.from_json[Status](payload) or return
+				status := self.status
+				status["{bid}\n{update.id}"] = update.record.state
+				self.status = status
+				()
+			}
+			"progress_report" => {
+				report :: json.from_json[Report](payload) or return
+				progress := self.progress
+				progress[bid] = match report.state {
+					"remove" => "",
+					"error" => " ✗",
+					_ => if percent := report.progress do " {percent}%" else do " %",
+				}
+				self.progress = progress
+				()
+			}
+			"program_status_removed" => {
+				if redraw do self.full = true
+				removed :: json.from_json[Removed](payload) or return
+				gone: []string = loop i in removed.ids do "{bid}\n{i}"
+				status: [string]string = .[]
+				loop state, key in self.status {
+					if key !in gone do status[key] = state
+				}
+				self.status = status
+				()
+			}
+			_ => {}
 		}
 		self.draw()
 	}
@@ -1687,6 +1716,7 @@ Client :< {
 			if wid in self.tiling do flags += " T"
 			if wid in self.belled do flags += " !"
 			flags += marks[urgency(self.win_state(win))]
+			flags += self.win_progress(win)
 
 			current :: wid == active
 			line += (if current do "\e[0;30;42m " else do "\e[0m ") + tab + (if current do "" else do "\e[33m") + flags + " "
