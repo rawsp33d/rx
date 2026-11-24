@@ -2737,7 +2737,7 @@ Client :< {
 				if id == "" do return error("no minimized pane")
 				self.ok("session.set_layer_state", ["layer_id" = id, "state" = "normal", "focus" = true])?
 			},
-			"layer.new" => self.pop(opts.command or "")?,
+			"layer.new" => self.pop(opts.command or "", opts.keep or false, opts.bounds or popup())?,
 			"layer.scratch" => self.scratch("scratch", self.view.windows or [], opts.opacity or 1.0)?,
 			"layer.scratch_tab" => self.scratch("tab scratch", [self.win()], opts.opacity or 1.0)?,
 			"pane.focus" => self.ok("session.focus_direction", ["direction" = dir, "wrap" = true])?,
@@ -2840,13 +2840,13 @@ Client :< {
 		false
 	}
 
-	pop :: fn(mut self; cmd: string) ! {
+	pop :: fn(mut self; cmd: string, keep := false, bounds: json.Arr = popup()) ! {
 		opts: Obj = []
 		if cmd != "" {
 			opts["command"] = ["env", "RX_PANE=" + self.bid, "sh", "-c", cmd]
-			opts["exit"] = ["quick_exit_threshold_ms" = 0.0]
+			opts["exit"] = ["quick_exit_threshold_ms" = 0.0, "on_completion" = !keep]
 		}
-		self.ok("session.new_layer", ["bounds" = popup(), "layout" = rex.shell(self.here(), opts), "focus" = true])?
+		self.ok("session.new_layer", ["bounds" = bounds, "layout" = rex.shell(self.here(), opts), "focus" = true])?
 	}
 
 	scratch :: fn(mut self; label: string, wins: []Window, opacity: float) ! {

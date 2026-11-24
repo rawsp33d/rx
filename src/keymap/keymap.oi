@@ -47,7 +47,7 @@ pub REQUEST :: r"""{
 		{"name": "pane.dim", "kind": "client", "title": "dim unfocused panes"},
 		{"name": "macro.record", "kind": "client", "title": "record macro"},
 		{"name": "macro.play", "kind": "client", "title": "play macro"},
-		{"name": "layer.new", "kind": "client", "title": "extra", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
+		{"name": "layer.new", "kind": "client", "title": "extra", "args": {"type": "object", "properties": {"command": {"type": "string"}, "keep": {"type": "boolean"}, "bounds": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}}},
 		{"name": "pane.pipe", "kind": "client", "title": "pipe output", "args": {"type": "object", "properties": {"command": {"type": "string"}}}},
 		{"name": "pane.run", "kind": "client", "title": "run command", "args": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
 		{"name": "layer.move", "kind": "client", "title": "move layer", "args": {"type": "object", "properties": {"direction": {"enum": ["right", "down", "left", "up"]}, "cells": {"type": "integer", "minimum": 1}}}},
@@ -121,6 +121,8 @@ pub Args :: struct {
 	pub opacity: ?float,
 	pub text: ?string,
 	pub confirm: ?bool,
+	pub keep: ?bool,
+	pub bounds: ?json.Arr,
 }
 
 pub Keymap :: struct {
