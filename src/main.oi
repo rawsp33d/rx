@@ -625,7 +625,9 @@ List :< {
 			}
 
 			# only grows, a smaller box leaves the old one's edges
-			visible = (if wide do rows else do all.len()) |> min($, room) |> max($, visible)
+			visible = (if wide do rows else do items.len())
+				|> min($, room)
+				|> max($, visible)
 			y :: max((room - visible) / 2, 0)
 
 			i = clamp(i, 0, max(hits.len() - 1, 0))
