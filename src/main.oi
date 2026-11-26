@@ -476,8 +476,8 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 			}
 		}
 
-		look :: fn [sock, sessions] (index: int) []string {
-			peek(sock, sessions[index].session_id) or []
+		look :: fn [sock, sessions] (index, w, h: int) []string {
+			peek(sock, sessions[index].session_id, w, h) or []
 		}
 
 		picked, name :: list.choose(mut input, rows, look)
@@ -592,7 +592,7 @@ List :< {
 	choose :: fn(
 		with mut self; mut input: Input,
 		more: fn(string) []string = { [] },
-		preview: ?fn(int) []string = none,
+		preview: ?fn(int, int, int) []string = none,
 	) (picked: int, name: string) {
 		picked = -1
 		size :: tty.size(1) or return
@@ -643,14 +643,13 @@ List :< {
 			out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> {query}"], foot))
 
 			if look := preview; wide {
-				hit :: if on >= 0 && hits[i] < items.len() do hits[i] else do -1
-				if hit != peeked {
-					lines = if hit >= 0 do look(hit) else do []
-					peeked = hit
-				}
-
 				# as tall as the list box, with its query and rules
 				height :: visible + foot.len() + 3
+				hit :: if on >= 0 && hits[i] < items.len() do hits[i] else do -1
+				if hit != peeked {
+					lines = if hit >= 0 do look(hit, cols - w - 6, height) else do []
+					peeked = hit
+				}
 				skip :: max(lines.len() - height, 0)
 				tail: []string = loop j in 0..height {
 					if j + skip < lines.len() do lines[j + skip] else do ""
@@ -713,8 +712,8 @@ manage :: fn(sock, method: string, payload: Obj) ![]Session {
 	conn.call[Sessions]("session.list")?.sessions
 }
 
-## A tab's focused pane as text, the active tab's by default.
-peek :: fn(sock, sid: string, wid := "") ![]string {
+## A tab's tiled panes as text in w by h cells, the active tab's by default.
+peek :: fn(sock, sid: string, w, h: int, wid := "") ![]string {
 	conn := rex.connect(sock)?
 	defer conn.close()
 
@@ -722,12 +721,34 @@ peek :: fn(sock, sid: string, wid := "") ![]string {
 	view :: conn.call[View]("session.view", ["session_id" = sid])?
 	tab :: if wid != "" do wid else do view.active_window_id or ""
 	win :: (view.windows or []).find({ $.window_id == tab }) or return []
+	if win.layers.len() == 0 do return []
 
-	args: Obj = [
-		"session_id" = sid,
-		"block_id" = win.focused_block_id or "",
-		"args" = ["trim" = true, "max_bytes" = 1.0],
-	]
+	layer :: win.layers[0]
+	panes :: leaves(layer.layout or :null)
+	texts: [][]string = loop leaf in panes do contents(mut conn, sid, leaf.bid) or []
+
+	# leaves run left to right along a row, and each pane owns its right and bottom borders
+	loop y in ..h {
+		row := ""
+		loop leaf, k in panes {
+			px, py, pw, ph :: rex.grid(leaf.rect, layer.bounds, w, h)
+			if y < py || y > py + ph do continue
+
+			lines :: texts[k]
+			at :: y - py + max(lines.len() - ph, 0)
+			if y == py + ph {
+				row += (loop 0..pw do "─").join("")
+			} else {
+				row += pad(if at < lines.len() do lines[at] else do "", pw)
+			}
+			if px + pw < w do row += "│"
+		}
+		row
+	}
+}
+
+contents :: fn(mut conn: rex.Rex, sid, bid: string) ![]string {
+	args: Obj = ["session_id" = sid, "block_id" = bid, "args" = ["trim" = true, "max_bytes" = 1.0]]
 	text :: conn.call[Text]("com.superlogical.terminal.format", args)?
 	id :: text.id or return text.content.split("\n").map(printable)
 
@@ -2531,7 +2552,7 @@ Client :< {
 		self.perform(keymap.Binding.{ action = action.name, args = Json.(args) }, keys.Key.{})
 	}
 
-	choose :: fn(mut self; title: string, items: []string, preview: ?fn(int) []string = none) int {
+	choose :: fn(mut self; title: string, items: []string, preview: ?fn(int, int, int) []string = none) int {
 		self.modes = ""
 		list := List.{ title = title, items = items }
 		picked, _ :: list.choose(mut self.keys, preview = preview)
@@ -3014,8 +3035,8 @@ Client :< {
 				}
 
 				sock :: self.sock
-				look :: fn [sock, sids, wids] (index: int) []string {
-					peek(sock, sids[index], wids[index]) or []
+				look :: fn [sock, sids, wids] (index, w, h: int) []string {
+					peek(sock, sids[index], w, h, wids[index]) or []
 				}
 				i :: self.choose(title, items, look)
 
