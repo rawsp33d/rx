@@ -1327,8 +1327,20 @@ Client :< {
 		}
 		self.wid = win.window_id
 		self.bid = bid
+		wins :: self.view.windows or []
+		live :: [
+			..wins.map({ $.window_id }),
+			..loop other in wins; layer in other.layers {
+				layer.layer_id or ""
+			},
+		]
+
 		self.belled = loop id in self.belled {
-			if id == self.wid || win.layers.any({ ($.layer_id or "") == id && ($.state or "") != "minimized" }) do continue
+			if id !in live do continue
+			if id == self.wid && win.zoomed_block_id == none do continue
+			if win.layers.any({ ($.layer_id or "") == id && ($.state or "") != "minimized" }) {
+				continue
+			}
 			id
 		}
 
@@ -1901,8 +1913,11 @@ Client :< {
 
 			id := win.window_id
 			if id == self.wid {
-				if (layer.state or "") != "minimized" do continue
-				id = layer.layer_id or ""
+				if (layer.state or "") == "minimized" {
+					id = layer.layer_id or ""
+				} else if win.zoomed_block_id == none || (win.zoomed_block_id or "") == bid {
+					continue
+				}
 			}
 
 			if id !in self.belled do self.belled << id
