@@ -3189,6 +3189,16 @@ Client :< {
 		}
 		self.titles = titles
 		self.arg_words = arg_words
+
+		scratches: [string]string = ["layer.scratch" = "scratch", "layer.scratch_tab" = "tab scratch"]
+		opacities := self.opacities
+		loop binding in km.bindings {
+			label :: scratches[binding.action] or continue
+			args :: json.from_json[keymap.Args](binding.args or continue) or continue
+			opacities[label] = args.opacity or continue
+		}
+
+		self.opacities = opacities
 		self.peers = (self.others() or []).len()
 	}
 
