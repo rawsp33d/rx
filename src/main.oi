@@ -1237,6 +1237,10 @@ Client :< {
 			"bell" => {
 				out("\a")
 				self.flag(bid)
+
+				if !self.panes.any({ $.bid == bid }) {
+					self.say("bell in " + self.home(bid))
+				}
 			}
 			"clipboard_written" => {
 				clip :: json.from_json[Clip](payload) or Clip.{}
@@ -1879,6 +1883,16 @@ Client :< {
 			self.modes_on.last() or ""
 		}
 		box(0, bottom - rows.len() - 2, w + 2, title, rows)
+	}
+
+	home :: fn(self; bid: string) string {
+		loop win, i in self.view.windows or []; layer in win.layers {
+			if !leaves(layer.layout or :null).any({ $.bid == bid }) do continue
+			return if win.window_id == self.wid && layer.kind != "tiled"
+				do "float"
+				else do "tab {i + 1}"
+		}
+		"?"
 	}
 
 	flag :: fn(mut self; bid: string) {
