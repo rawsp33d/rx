@@ -43,7 +43,7 @@ pub REQUEST :: r"""{
 		{"name": "client.detach_others", "kind": "client", "title": "detach other clients"},
 		{"name": "client.config.reload", "kind": "client", "title": "reload config"},
 		{"name": "mouse.toggle", "kind": "client", "title": "toggle mouse"},
-		{"name": "pane.titles", "kind": "client", "title": "toggle pane titles"},
+		{"name": "pane.titles", "kind": "client", "title": "toggle pane titles", "args": {"type": "object", "properties": {"position": {"enum": ["top", "bottom"]}}}},
 		{"name": "pane.dim", "kind": "client", "title": "dim unfocused panes"},
 		{"name": "macro.record", "kind": "client", "title": "record macro"},
 		{"name": "macro.play", "kind": "client", "title": "play macro"},
@@ -126,6 +126,7 @@ pub Args :: struct {
 	pub title: ?string,
 	pub ratio: ?float,
 	pub main: ?int,
+	pub position: ?string,
 }
 
 pub Keymap :: struct {

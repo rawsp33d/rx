@@ -1025,7 +1025,7 @@ Client :: struct {
 	modes: string
 	owned: bool
 	full, readonly, bare, mouse_off, dim, recording: bool
-	frames: bool # like tmux's pane-border-status bottom
+	frames: string # top or bottom, like tmux's pane-border-status
 	choose, detach: bool
 	next, dir: string
 	km: keymap.Keymap
@@ -1189,7 +1189,7 @@ Client :< {
 		self.fg = fg
 		self.status = status
 		self.seen = seen
-		if !self.frames do return
+		if self.frames == "" do return
 		labels: [string]string = .[]
 		blocks :: (self.call[Blocks]("session.list_blocks") or Blocks.{}).blocks
 		loop block in blocks do labels[block.block_id] = block.label or ""
@@ -1231,7 +1231,7 @@ Client :< {
 	block_event :: fn(mut self; change: Change) {
 		bid :: change.block_id or ""
 		payload :: change.payload or :null
-		redraw :: self.frames
+		redraw :: self.frames != ""
 
 		match change.name or "" {
 			"bell" => {
@@ -1345,9 +1345,18 @@ Client :< {
 		}
 
 		tiled :: (win.layers.find({ $.kind == "tiled" }) or Layer.{}).layer_id or ""
-		self.areas = [Area.{ w = self.cols, h = h - if self.frames do 1 else do 0, id = tiled }]
-		whole :: [0.0, 0.0, 1.0, 1.0]
+		self.areas = [
+			Area.{
+				y = if self.frames == "top" do 1 else do 0,
+				w = self.cols,
+				h = h - if self.frames != "" do 1 else do 0,
+				id = tiled,
+			}
+		]
+
+		whole :: [0.0 0.0 1.0 1.0]
 		kept := []Pane.{}
+
 		loop layer in win.layers {
 			tiled :: layer.kind == "tiled"
 			if win.zoomed_block_id != none || (layer.state or "") == "minimized" do continue
@@ -1675,7 +1684,8 @@ Client :< {
 	borders :: fn(self; layer: int) string {
 		area :: self.areas[layer]
 		cols :: self.cols
-		bottom :: area.y + area.h + if self.frames && layer == 0 do 1 else do 0
+		top :: area.y - if self.frames == "top" && layer == 0 do 1 else do 0
+		bottom :: area.y + area.h + if self.frames == "bottom" && layer == 0 do 1 else do 0
 		focus := Pane.{ x = -2, y = -2 }
 		edge: [int]() = .[]
 		buf := Buffer.{}
@@ -1686,7 +1696,10 @@ Client :< {
 			if pane.bid == self.bid do focus = pane
 			right, below :: pane.x + pane.w, pane.y + pane.h
 			if right < area.x + area.w {
-				loop y in pane.y..min(below + 1, bottom) do edge[y * cols + right] = ()
+				loop y in max(pane.y - 1, top)..min(below + 1, bottom) do edge[y * cols + right] = ()
+			}
+			if pane.y > top {
+				loop x in pane.x..min(right + 1, area.x + area.w) do edge[(pane.y - 1) * cols + x] = ()
 			}
 			if below < bottom {
 				loop x in pane.x..min(right + 1, area.x + area.w) do edge[below * cols + x] = ()
@@ -1723,12 +1736,13 @@ Client :< {
 		}
 
 		loop pane in self.panes {
-			if !self.frames do break
+			if self.frames == "" do break
 			title :: self.pane_title(pane) + marks[urgency(self.state(pane.bid))]
 			if pane.layer != layer || title == "" || pane.w < 5 do continue
 
 			color :: if pane.bid == self.bid do "\e[1;32m" else do "\e[0;39m"
-			buf.write("\e[{pane.y + pane.h + 1};{pane.x + 2}H" + color + " " + fit(printable(title), pane.w - 4) + " \e[0m")
+			row :: if self.frames == "top" do pane.y else do pane.y + pane.h + 1
+			buf.write("\e[{row};{pane.x + 2}H" + color + " " + fit(printable(title), pane.w - 4) + " \e[0m")
 		}
 		buf.str()
 	}
@@ -2858,7 +2872,8 @@ Client :< {
 				if self.macro == "" do return error("nothing recorded")
 			},
 			"pane.titles" => {
-				self.frames = !self.frames
+				position :: opts.position or "bottom"
+				self.frames = if self.frames == position do "" else do position
 				self.fetch_status()
 				self.relayout()?
 			},
