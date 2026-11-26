@@ -44,7 +44,7 @@ Removed :: struct { ids: []string }
 reset_modes :: "\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?1l\e[?66l\e[=0;1u\e[?25h\e[0 q\e[0m"
 
 ## All motion for link hover.
-mouse_on :: "\e[?1003h\e[?1006h"
+mouse_on :: "\e[?1002h\e[?1003h\e[?1006h"
 
 # outer kitty ids, past the scratch tints'
 image_ids :: 1 << 24
