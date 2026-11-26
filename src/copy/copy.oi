@@ -6,6 +6,7 @@ use regex
 pub Copy :: struct {
 	pub bid: string # "" when off
 	pub x: int, pub y: int, pub ax: int, pub ay: int
+	pub top: int # viewport top, saved when its pane closes
 	pub sel: string # "v" characters, "V" lines, "ctrl+v" a block, "" nothing
 	pub needle: string
 	pub marks: []int

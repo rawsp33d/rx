@@ -1363,7 +1363,10 @@ Client :< {
 		if zoomed := win.zoomed_block_id {
 			kept = self.place([Leaf.{ bid = zoomed, rect = whole }], whole, 0)
 		}
-		loop pane in self.panes do pane.close()
+		loop pane in self.panes {
+			self.keep_top(pane)
+			pane.close()
+		}
 		self.panes = kept
 		self.refocus()
 		self.landed()
@@ -1432,7 +1435,10 @@ Client :< {
 	reopen :: fn(mut self; i: int) {
 		old :: self.panes[i]
 		pane := self.open(old.bid) or return
+
+		self.keep_top(old)
 		old.close()
+
 		pane.x = old.x
 		pane.y = old.y
 		pane.w = old.w
@@ -2076,11 +2082,16 @@ Client :< {
 		mode := self.copy_of(pane.bid)
 		if mode.bid == "" do return
 
-		_, _, total := pane.term.viewport()
+		top, _, total := pane.term.viewport()
+		if mode.top != top {
+			discard pane.term.scroll(mode.top - top)
+		}
+
 		mode.ay = clamp(mode.ay, 0, total - 1)
 		mode.go(pane.term, mode.x, mode.y)
 		mode.marks = pane.term.find(mode.needle)
 		ax, ay, bx, by := mode.ends(pane.term)
+
 		pane.term.select(
 			ax,
 			if mode.sel == "" do -1 else do ay,
@@ -2088,6 +2099,20 @@ Client :< {
 			by,
 			mode.sel == "ctrl+v",
 		)
+
+		self.put_copy(mode)
+	}
+
+	## the scroll a closing pane's copy mode comes back to
+	keep_top :: fn(mut self; pane: Pane) {
+		mode := self.copy_of(pane.bid)
+		if mode.bid == "" || !pane.painted do return
+
+		mode.top = pane.term.viewport().0
+		self.put_copy(mode)
+	}
+
+	put_copy :: fn(mut self; mode: Copy) {
 		if self.cp.bid == mode.bid {
 			self.cp = mode
 			return
