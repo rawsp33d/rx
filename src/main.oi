@@ -448,7 +448,6 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 
 	bad: string
 	marks: []string
-	previews: [string][]string
 	loop {
 		out("\e[0m\e[H\e[2J" + bottom + "\e[31m{bad}\e[0m")
 		bad = ""
@@ -477,10 +476,8 @@ pick :: fn(sock: string, sessions: []Session, mut input: Input, at: string) (str
 			}
 		}
 
-		look :: fn [mut previews, sock, sessions] (index: int) []string {
-			sid :: sessions[index].session_id
-			if sid !in previews do previews[sid] = peek(sock, sid) or []
-			previews[sid] or []
+		look :: fn [sock, sessions] (index: int) []string {
+			peek(sock, sessions[index].session_id) or []
 		}
 
 		picked, name :: list.choose(mut input, rows, look)
@@ -612,6 +609,8 @@ List :< {
 		room :: rows - foot.len() - 6
 		x := if wide do 0 else do (cols - w - 2) / 2
 		gutter, visible := 0, 1
+		peeked := -1
+		lines: []string
 
 		loop tag in tags do gutter = max(gutter, cells(tag))
 
@@ -644,7 +643,12 @@ List :< {
 			out(reset_modes + "\e[?2026h" + box(x, y, w, title, shown, on, ["> {query}"], foot))
 
 			if look := preview; wide {
-				lines: []string = if on >= 0 && hits[i] < items.len() do look(hits[i]) else do []
+				hit :: if on >= 0 && hits[i] < items.len() do hits[i] else do -1
+				if hit != peeked {
+					lines = if hit >= 0 do look(hit) else do []
+					peeked = hit
+				}
+
 				# as tall as the list box, with its query and rules
 				height :: visible + foot.len() + 3
 				skip :: max(lines.len() - height, 0)
@@ -655,8 +659,25 @@ List :< {
 			}
 			out("\e[{y + 2};{x + 5 + cells(query)}H\e[?25h\e[?2026l")
 
+			if wide && input.unread == "" {
+				sync.select! {
+					data := <-input.chan => {
+						input.unread = data or return
+						()
+					},
+					sync.after(1.sec()) => {},
+				}
+
+				# nothing typed for a second, so peek again
+				if input.unread == "" {
+					peeked = -1
+					continue
+				}
+			}
+
 			key :: input.next() or return
 			if key.action != "press" do continue
+
 			name = key.names[0]
 			if name in ["esc", "ctrl+c"] do return
 			if numbered && name.starts_with("alt+") {
@@ -2992,11 +3013,9 @@ Client :< {
 					}
 				}
 
-				previews: [string][]string
 				sock :: self.sock
-				look :: fn [mut previews, sock, sids, wids] (index: int) []string {
-					if wids[index] !in previews do previews[wids[index]] = peek(sock, sids[index], wids[index]) or []
-					previews[wids[index]] or []
+				look :: fn [sock, sids, wids] (index: int) []string {
+					peek(sock, sids[index], wids[index]) or []
 				}
 				i :: self.choose(title, items, look)
 
