@@ -16,6 +16,10 @@ pub complete :: fn(line: string, names: []string, args: [string][]string = .[]) 
 	head + prefix
 }
 
+pub kind_of :: fn(arg: string) ?string {
+	["session" "window" "block" "client"].find({ arg == $ + "_id" })
+}
+
 pub chop :: fn(line: string) string {
 	if line == "" do return line
 	end := line.len() - 1

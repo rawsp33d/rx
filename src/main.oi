@@ -16,7 +16,7 @@ use strip
 use keys
 use keymap
 use ghostty
-use prompt.{ complete, chop, value, words, fuzzy, matches, substrings }
+use prompt.{ complete, kind_of, chop, value, words, fuzzy, matches, substrings }
 use layout.{ Area, Tile, layouts, arrange, rotation, evened, stretch, shift, border }
 use copy.{ Copy, Hit, hits, word }
 use encoding.base64
@@ -1708,6 +1708,34 @@ Client :< {
 		line
 	}
 
+	# target args also complete to labels, window positions and short ids
+	targets :: fn(mut self) ![string][]string {
+		hits: [string][]string = .[]
+		args := self.arg_words
+		loop have, name in self.arg_words; word in have {
+			kind :: kind_of(word.split("=")[0]) or continue
+			if kind !in hits {
+				query: Obj = ["kinds" = [kind], "prefix" = "", "context" = ["session_id" = self.sid]]
+				hits[kind] = (self.conn.call[rex.Completions]("target.complete", query)?.completions or []).map({ word + $.value })
+			}
+			args[name] = [..(args[name] or []), ..(hits[kind] or [])]
+		}
+		args
+	}
+
+	resolve :: fn(mut self; name, text: string) !Json {
+		kind :: kind_of(name) or return value(text)
+		query: Obj = ["kinds" = [kind], "queries" = [text], "context" = ["session_id" = self.sid]]
+		lookup :: self.conn.call[rex.Lookups]("target.resolve", query)?.results[0]
+		target :: lookup.target or return error("{kind} {text}: {lookup.status}")
+		Json.(match kind {
+			"session" => target.session_id,
+			"window" => target.window_id,
+			"block" => target.block_id,
+			_ => target.client_id,
+		} or "")
+	}
+
 	confirm :: fn(mut self; prompt: string) bool {
 		out(reset_modes)
 		self.modes = ""
@@ -2547,7 +2575,7 @@ Client :< {
 		loop arg in (action.args or keymap.Schema.{}).required or [] {
 			answer :: self.ask("{action.title or action.name} {arg}: ")
 			if answer == "" do return false
-			args[arg] = value(answer)
+			args[arg] = self.resolve(arg, answer)?
 		}
 		self.perform(keymap.Binding.{ action = action.name, args = Json.(args) }, keys.Key.{})
 	}
@@ -2857,13 +2885,13 @@ Client :< {
 			"client.config.reload" => discard self.conn.call[Ok]("server.config_reload")?,
 			"client.msg" => self.say(opts.text or return error("client.msg needs text")),
 			"client.prompt" => {
-				typed :: words(self.ask(": ", self.can.keys, self.arg_words))
+				typed :: words(self.ask(": ", self.can.keys, self.targets() or self.arg_words))
 				if typed.len() == 0 do return false
 				args: Obj = []
 				loop kv in typed[1..] {
 					pair :: kv.split("=")
 					if pair.len() < 2 do return error("{kv}: want name=value")
-					args[pair[0]] = value(pair[1..].join("="))
+					args[pair[0]] = self.resolve(pair[0], pair[1..].join("="))?
 				}
 				return self.perform(keymap.Binding.{ action = typed[0], args = Json.(args) }, keys.Key.{})
 			},

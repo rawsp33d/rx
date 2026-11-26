@@ -28,6 +28,11 @@ pub Split :: struct { pub direction: string, pub ratio: float, pub before: Json,
 pub Attached :: struct { pub client_id: string, pub view: View }
 pub Created :: struct { pub session_id: string, pub initial_windows: ?[]NewWindow }
 pub NewWindow :: struct { pub window_id: string, pub block_ids: []string }
+pub Completions :: struct { pub completions: ?[]Completion }
+pub Completion :: struct { pub value: string }
+pub Lookups :: struct { pub results: []Lookup }
+pub Lookup :: struct { pub status: string, pub target: ?Target }
+pub Target :: struct { pub kind: string, pub session_id: ?string, pub window_id: ?string, pub block_id: ?string, pub client_id: ?string }
 pub Ticket :: struct { pub ticket: string }
 pub Ok :: struct {}
 pub Process :: struct { pub child: ?Proc, pub foreground: ?Proc }
